@@ -47,7 +47,7 @@ joeylab = "joeylab:main"
 
 [project.optional-dependencies]
 faces = [
-    "mediapipe>=0.10.14,<0.11",
+    "mediapipe>=0.10.14,<1.2",
     "onnxruntime>=1.18",
 ]
 ai = [
