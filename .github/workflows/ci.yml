@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests on macOS 14 (Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install exiftool
+        run: brew install exiftool
+
+      - name: Install JoeyLab with every extra
+        run: uv sync --all-extras
+
+      - name: Run the tests, offline
+        env:
+          JOEYLAB_OFFLINE: "1"
+          HF_HUB_OFFLINE: "1"
+        run: uv run pytest -q
+
+      - name: Build the package
+        run: uv build

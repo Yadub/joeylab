@@ -1,0 +1,10 @@
+world.json is made from Natural Earth's 1:50m "Land" and "Admin 0 - Boundary Lines" (land boundaries)
+datasets, version 5, simplified by make_world.py.
+
+Natural Earth: free vector and raster map data at naturalearthdata.com.
+
+All versions of Natural Earth raster and vector map data found on the Natural Earth website are in the
+public domain. No permission is needed to use Natural Earth. Crediting the authors is unnecessary, but
+appreciated: "Made with Natural Earth."
+
+https://www.naturalearthdata.com/about/terms-of-use/

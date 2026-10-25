@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Shared photos</title>
+  <link rel="icon" href="/static/icon.svg">
+  <link rel="stylesheet" href="/static/fonts/fonts.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="share-body">
+  <header class="share-head page">
+    <div class="page-head"><div><h1 id="title">Shared photos</h1><div class="sub" id="sub">Loading…</div></div></div>
+  </header>
+  <main class="share-grid" id="grid"></main>
+  <div id="big" class="share-big" hidden role="dialog" aria-modal="true" aria-label="Photo" tabindex="-1">
+    <img id="bigimg" alt="">
+    <button id="prev" class="btn icon-only share-nav prev" type="button" aria-label="Previous photo">‹</button>
+    <button id="next" class="btn icon-only share-nav next" type="button" aria-label="Next photo">›</button>
+    <button id="close" class="btn" type="button">Close</button>
+  </div>
+  <footer class="share-foot">Shared with JoeyLab, made by Yaduraj Bhageria</footer>
+  <div id="toasts" role="region" aria-label="Messages"></div>
+  <script type="module" src="/static/js/share.js"></script>
+</body>
+</html>

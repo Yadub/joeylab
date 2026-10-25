@@ -1,0 +1,74 @@
+[project]
+name = "joeylab"
+version = "0.9.0"
+description = "A private photo library on your own Mac: cull, find, name and tidy photos without touching the originals"
+readme = "README.md"
+authors = [{ name = "Yaduraj Bhageria" }]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+keywords = ["photos", "photo culling", "photo library", "duplicates", "exif", "xmp", "lightroom", "faces",
+            "image search", "local-first", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: Viewers",
+]
+dependencies = [
+    "fastapi>=0.115.8",
+    "numpy>=1.26",
+    # MediaPipe (the faces extra) requires opencv-contrib-python; on a Mac the core uses that same
+    # build, so there's one OpenCV (two packages would share, and overwrite, one cv2 module).
+    "opencv-contrib-python>=4.10 ; sys_platform == 'darwin'",
+    "opencv-python-headless>=4.10 ; sys_platform != 'darwin'",
+    "pi-heif>=0.20",
+    "pillow>=11.1",
+    "rawpy>=0.21",
+    "rich>=13.7",
+    "typer>=0.16",
+    "uvicorn>=0.30",
+    "watchdog>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Yadub/joeylab"
+Issues = "https://github.com/Yadub/joeylab/issues"
+Changelog = "https://github.com/Yadub/joeylab/blob/main/CHANGELOG.md"
+
+[project.scripts]
+joeylab = "joeylab:main"
+
+[project.optional-dependencies]
+faces = [
+    "mediapipe>=0.10.14,<0.11",
+    "onnxruntime>=1.18",
+]
+ai = [
+    "open-clip-torch>=2.32",
+    "torch>=2.4",
+    "transformers>=4.45",
+]
+mac = [
+    "pyobjc-framework-vision>=10.3 ; sys_platform == 'darwin'",
+]
+all = ["joeylab[faces,ai,mac]"]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "joeylab"            # the package is joeylab; the module and command are joeylab
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.0",
+]

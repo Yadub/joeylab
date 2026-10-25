@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>JoeyLab</title>
+  <meta name="theme-color" content="#F4F3EF" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1B1B19" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="JoeyLab">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/fonts/fonts.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <a class="skip-link" id="skip" href="#view">Skip to the page</a>
+  <header class="topbar" id="topbar"></header>
+  <main id="view"></main>
+  <div id="loupe" hidden></div>
+  <div id="toasts" role="region" aria-label="Messages"></div>
+  <div id="announce" class="sr-only" role="status" aria-live="polite"></div>
+  <div id="announce-now" class="sr-only" role="alert" aria-live="assertive"></div>
+  <noscript>JoeyLab needs JavaScript.</noscript>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
