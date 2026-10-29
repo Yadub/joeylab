@@ -19,10 +19,10 @@ import threading
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import Response
 
-from ... import cleanup, copies, db, library, raws
-from ..deps import conn_dep, filter_from, ids_of, require_owner, require_writer, viewer_of
+from ... import cleanup, copies, db, library, locks, raws
+from ..deps import conn_dep, filter_for, ids_of, require_owner, require_writer, viewer_of
 from .library import browse_filter
-from .trash import TrashJob, _job, _jobs, reindex
+from .trash import LOCK_WAIT_S, UPDATE_RUNNING, TrashJob, _job, _jobs, reindex
 
 router = APIRouter()
 
@@ -64,7 +64,7 @@ def _shot_ids(conn, request: Request, body: dict) -> list[int] | None:
     q = body.get("filter")
     if q is None:
         return None
-    flt = filter_from(q, viewer_of(request))
+    flt = filter_for(conn, q, viewer_of(request))
     if str(q.get("all")) not in ("1", "true"):
         flt = browse_filter(conn, flt)
     return [s["id"] for s in library.shots(conn, flt)]
@@ -196,15 +196,18 @@ def api_raw_run(p: str, token: str, request: Request, body: dict = Body(default_
     def work():
         c = db.connect(p, create=False)
         try:
-            log = raws.trash(c, job.items, f"{p}-files", progress=lambda n, total: setattr(job, "done", n))
+            with locks.project_lock(p, wait=LOCK_WAIT_S):        # never alongside an update (see routes/trash.py)
+                log = raws.trash(c, job.items, f"{p}-files", progress=lambda n, total: setattr(job, "done", n))
             done, size = raws.moved(go)
-            job.result = {"moved": len(done), "bytes": size, "sidecars": sum(s.result == "moved to the Trash" for i in done for s in i.sidecars),
+            job.result = {"moved": len(done), "bytes": size, "sidecars": sum(s.result == cleanup.MOVED for i in done for s in i.sidecars),
                           "log": log, "ids": sorted({i.shot_id for i in done}),
-                          "left": [{"path": i.path, "why": i.result} for i in go if i.result != "moved to the Trash"][:50]}
+                          "left": [{"path": i.path, "why": i.result} for i in go if i.result != cleanup.MOVED][:50]}
             if done:
                 bg.rescore(p)                # "fixable in editing" needs a RAW
                 reindex(c, p)
             job.state = "done"
+        except locks.Busy:
+            job.state, job.error = "error", UPDATE_RUNNING
         except Exception as e:                       # shown in the dialog (another move running, say)
             job.state, job.error = "error", str(e)
         finally:

@@ -273,6 +273,12 @@ def rewrite_paths(conn, old: str, new: str) -> dict:
     return counts
 
 
+def rewrite_left_out(conn, old: str, new: str) -> int:
+    """A folder the library leaves out (moved to another library) was renamed or moved in Finder: it's
+    left out under its new path (and so is anything left out inside it). Catalog only; the caller commits."""
+    return _rewrite(conn, "excluded_folders", "folder", old, new)
+
+
 def stale_links(conn, old: str) -> int:
     """Links in album folders JoeyLab made that point inside `old` (they break when it moves)."""
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='album_links'").fetchone():

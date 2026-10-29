@@ -67,9 +67,31 @@ Golf, Trekking, Road trip, Cameras, Watches, Shoes, Bags, Toys, Plants, Housepla
 Walls, Textures, Patterns, Close-ups, Jewellery, Musical instruments, Guitars, Tools, Car interiors, Trophies, Gifts,
 Balloons, Clocks, Lamps, Black-and-white photos, Black-and-white portraits, Black-and-white street photos,
 Long exposures, Light trails, Reflections, Shadows, Minimalism, Abstract, Bokeh, Blurry photos, Dark photos,
-Old photographs, Scans, Maps, Charts, Illustrations, Cartoons, Logos"""
+Old photographs, Scans, Maps, Charts, Illustrations, Cartoons, Logos, Haldi, Mehendi, Sangeet, Baraat, Varmala,
+Pheras, Vidaai, Wedding reception, Sadya, Pookalam, Diwali, Holi"""
 VOCAB = [w.strip() for w in VOCAB.replace("\n", " ").split(",") if w.strip()]
+# Words the text encoder knows better described: an Indian wedding's occasions and festivals, as a photo of
+# them shows (the region is still called by the word).
+DESCRIBED = {
+    "Haldi": "a haldi ceremony with turmeric paste on an indian bride or groom",
+    "Mehendi": "henna patterns on a bride's hands at a mehendi",
+    "Sangeet": "a sangeet: wedding guests dancing to bollywood music in front of a big led screen",
+    "Baraat": "a baraat, the groom's wedding procession with dancing and a band",
+    "Varmala": "an indian bride and groom exchanging flower garlands",
+    "Pheras": "an indian bride and groom walking around a sacred fire",
+    "Vidaai": "a bride throwing rice back over her head as she leaves home",
+    "Wedding reception": "a bride and groom on a decorated stage at their wedding reception",
+    "Sadya": "a sadya feast on a banana leaf",
+    "Pookalam": "a pookalam, a kerala flower carpet of petals",
+    "Diwali": "diwali with lit diyas, oil lamps and fireworks",
+    "Holi": "people covered in bright coloured powder at holi",
+}
 SAME_WORD = 0.93           # two words whose text vectors are this close say the same thing ("Dance", "Dancers")
+# A described word (DESCRIBED) must fit a region by this much more than a plain one: a sentence about an
+# Indian wedding sits closer to any photo of people in Indian clothes than one word does. On real libraries
+# it kept dance performances and saree portraits under their own names, and wedding regions still took
+# Haldi, Sangeet and the rest.
+DESCRIBED_HANDICAP = 0.02
 DISTINCT = 0.75            # how much a word gains for fitting one region better than it fits the others
 SECOND_WITHIN = 0.012      # a second word must score nearly as well as the first
 
@@ -545,14 +567,14 @@ def _model_words(model: str, words: list[str]) -> np.ndarray | None:
             if not ai.available():
                 return None
             m = ai.Models.get()
-        return np.stack([m.embed_text(w) for w in words]).astype(np.float32)
+        return np.stack([m.embed_text(DESCRIBED.get(w, w)) for w in words]).astype(np.float32)
     except Exception:
         return None
 
 
 def word_vectors(model: str) -> np.ndarray | None:
     """VOCAB's text vectors (unit rows), worked out once and kept in ~/.joeylab/models."""
-    key = hashlib.sha1(json.dumps([_encoder_tag(model), VOCAB]).encode()).hexdigest()[:12]
+    key = hashlib.sha1(json.dumps([_encoder_tag(model), VOCAB, DESCRIBED]).encode()).hexdigest()[:12]
     path = config.MODELS_DIR / f"explore-words-{key}.npz"
     if path.exists():
         try:
@@ -585,6 +607,7 @@ def name_clusters(centres: np.ndarray, W: np.ndarray, words: list[str] = VOCAB) 
     A second word is added when it says something the first doesn't."""
     S = centres @ W.T
     score = S + DISTINCT * (S - S.mean(0))
+    score[:, [k for k, w in enumerate(words) if w in DESCRIBED]] -= DESCRIBED_HANDICAP
     WW = W @ W.T
     out = []
     for j in range(len(centres)):
@@ -781,7 +804,7 @@ def _inputs_key(by: str, P: dict) -> str:
 
 
 def _content_key(conn, P: dict) -> str:
-    words = hashlib.sha1("|".join(VOCAB).encode()).hexdigest()[:8]           # new words: the regions named again
+    words = hashlib.sha1(json.dumps([VOCAB, DESCRIBED]).encode()).hexdigest()[:8]    # new words: the regions named again
     return (f"{CONTENT_VERSION}:{words}:{db.counter(conn, 'search_gen')}:{db.counter(conn, 'emb_gen')}:{len(P['ids'])}:"
             f"{int(P['ids'].sum()) % 1000003}")
 
@@ -789,7 +812,7 @@ def _content_key(conn, P: dict) -> str:
 def available(conn) -> dict:
     """Which arrangements can be shown: True, or why not."""
     out = {k: True for k in ARRANGEMENTS}
-    if embeddings.matrix(conn) is None:
+    if not embeddings.has_vectors(conn):
         from . import search
 
         out["content"] = ("Arranging by what's in the photos needs the picture-search index, which is made during updates "

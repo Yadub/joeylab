@@ -145,6 +145,46 @@ it matches, `cluster()` regroups from scratch, and `switch_progress()` tells Peo
 
 `across_years()` suggests unnamed groups that are a named person at another age.
 
+Each face's capture quality (Apple Vision's `VNDetectFaceCaptureQualityRequest`: focus, light, expression and how
+the head is turned) is judged once, from its 200 px crop, by `faces.measure_quality` straight after faces are found
+(the update's faces step): a pass of its own, so faces found before it existed are judged without being found
+again. Faces still to judge are read from a partial index of only those (`faces_unjudged`, m19); a face that can't
+be judged, and every pet, is stored as -1. Batches of 64 photos are saved in one write each, with the photo's
+quality (`metrics.face_quality`, its main faces' by their size). It takes under 2 ms a face. `scoring.caught` puts
+it on 0–1 over the range most faces fall in: a quarter of scoring's faces part, and in Cull's face compare the
+tie-break, with smiles and focus, between frames with as many eyes open.
+
+### Pets (`pets.py`)
+
+Apple Vision finds dogs and cats, each with a box, on every photo's 768 px thumbnail (`VNRecognizeAnimalsRequest`),
+and where it sees people (`VNDetectHumanRectanglesRequest`). What it found is kept per photo in the `animals`
+table (m19) with a stamp of its own (`pets.VERSION`), so a library indexed for search before is only looked at for
+animals; nothing about search is redone. The pass runs after the search index, under the update's search step, in
+batches of 16 photos, each saved in one short write; a stop keeps what was saved. It takes about 7 ms a photo
+(a minute or two per 10,000 photos), plus about 50 ms for each animal's vector.
+
+Each dog or cat at least `MIN_PX` wide on the thumbnail is a row in `faces` of kind `'pet'` and model
+`pets.MODEL`, with the search model's vector (SigLIP 2) of its box squared up, and a 200 px crop like a face's.
+Everything People does with faces then works for pets: groups, naming, "Is this …?", "not this one", merging,
+undo, the Library's people filter, search by name, events' people. What keeps them apart:
+
+* face models' vectors and pets' are never compared: `faces.vectors()` reads one model's rows, and people's
+  grouping leaves out every face of kind `'pet'` (`faces.animal_ids`, from the `faces_kind` index);
+* a photo's faces found again replace only the face models' rows;
+* `pets.cluster` groups pets afresh whenever pets were found or named (there are few), with `faces._cluster_full`
+  and pets' own bars (`pets.LIMITS`), on vectors centred on the library's pets (`pets.vectors`): as they come, any
+  two dogs on a lawn look alike, while centred, what tells them apart counts;
+* People lists pets' groups apart (`pet_groups`), and naming one makes a new name a pet, never turning someone
+  already named into one.
+
+A face the face models found that is an animal's (a dog's face taken for a person's) is set aside at every update
+by `pets.animal_faces`, looking only at photos with an animal: at least `INSIDE` of the face in a dog's or cat's
+box, and no person's box (Vision's human rectangles) holding `NOBODY` of it. It's marked kind `'pet'`, leaves its
+group and name, and stops counting in its photo's face scores (`faces.refresh_metrics`); the viewer and Cull's
+face compare leave it out. A face you named, or said isn't someone, is never touched. `pets.set_kind` puts one
+back (People › Name faces › Animals' faces): kind `'person'`, which the check never overrides and a face found
+again in the same place keeps (`faces.same_place`), and `faces.place` puts it in the group it fits.
+
 The InsightFace models are for non-commercial use only, which is why the choice is offered and nothing is chosen
 by default.
 
@@ -155,16 +195,21 @@ These stages read the 768 px thumbnails, not the originals.
 * `ai.py` embeds each thumbnail with CLIP ViT-L/14 (open_clip) and scores it with the LAION aesthetic predictor.
   These feed scene grouping, similar photos, taste and the quality score.
 * `search.py` indexes each thumbnail with SigLIP 2 (`ViT-B-16-SigLIP2-384`) on the whole frame plus 9 overlapping
-  tiles, and on macOS with Apple Vision labels and text recognition (`pyobjc-framework-vision`). A search combines
+  tiles, and on macOS with Apple Vision labels and text recognition in every language Vision reads, detected per
+  photo (`pyobjc-framework-vision`; photos read before keep their text). A search combines
   SigLIP's calibrated match probability with label and text hits. The vectors are read from one memory-mapped
   float16 file in `cache/search`, stamped with a counter the indexer bumps (`meta.search_gen`) so it's never stale.
 * `embeddings.py` gives every other module one whole-frame vector per photo (SigLIP 2 when there is one, else
   CLIP), cached in memory until a counter changes.
 * `scenes.py` names events by what they show ("Climbing", "Wedding") by comparing photos with a short list of
-  descriptions, on the Mac.
+  descriptions, on the Mac. Each kind is described as a photo of it looks (turmeric for a haldi, a fire for the
+  pheras), since the model matches captions; an event split between an Indian wedding's occasions is a Wedding
+  when together they have most of its photos (`PART_OF`). New descriptions are checked on real libraries' vectors
+  so they don't take over photos of other kinds.
 * `explore.py` makes Library › Explore's arrangements: every analysed photo gets a cell of its own on a grid
   (`snap`), placed by what it shows (t-SNE on the vectors, regions found by k-means and named from a list of plain
-  words with the same model's text encoder), by colour, light, time, quality or camera. Measured axes are spaced
+  words with the same model's text encoder; a few occasions are described in a sentence, `DESCRIBED`, and must fit
+  a region by `DESCRIBED_HANDICAP` more than a plain word), by colour, light, time, quality or camera. Measured axes are spaced
   by rank. Positions come from the whole library; filters only hide photos. The picture-vector layout is made in
   the background and kept in the catalog's settings; the others take up to a couple of seconds on a library of
   75,000 photos and are kept in memory and in the library's folder (`explore/`), each with the key of what it was
@@ -199,11 +244,15 @@ search is unavailable. JoeyLab never calls a remote AI service.
   place of one taken within 3 hours (a place you set on an event is kept);
 * `events.run` (`events.py`): events (gaps of 3 hours or jumps of 100 km) and trips (runs of events further than
   the trip distance from every home, or abroad; homes and the distance are app-wide, in `settings.json`), with
-  stable ids so names and merges stay. An event without GPS takes a guessed place from its folders' names
+  stable ids so names and merges stay (a merge is kept as pairs of photos in the `event_joins` setting;
+  `events.unmerge` takes a merge's pairs out and puts its events back, for Undo). An event without GPS takes a guessed place from its folders' names
   (`Gazetteer.folder_place`) or its cameras' time zone; the rule trips were found by is kept per library, and a
   page that finds it out of date finds them again in the background; `clocksync.py` finds camera clock offsets, applied to the shared timeline
   only;
 * `scoring.run` (`scoring.py`): the 0–100 quality score, flags and suggestions (pick, reject, worth checking).
+  Its aesthetic part is the LAION predictor's, with Apple Vision's aesthetics score (`vision.score`, stored by
+  the search index) as a quarter of it when both are there; on a real library this moved scores by under 4 points
+  for 90% of photos.
 
 ### Backups across drives and libraries (`copies.py`)
 

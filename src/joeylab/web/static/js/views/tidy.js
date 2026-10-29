@@ -232,9 +232,11 @@ export function mount(root, ctx) {
             h("div", { class: "muted" }, `${plural(s.n, "photo")} · ${(s.from || "").slice(0, 10)} – ${(s.to || "").slice(0, 10)}`)),
           input,
           h("button", { class: "btn small primary", onclick: async (e) => {
-            await api(P(p, "/folders/name"), { method: "POST", body: { path: s.path, name: input.value } });
-            e.currentTarget.textContent = "Named";
-            e.currentTarget.disabled = true;
+            const btn = e.currentTarget;            // (gone from the event once it's awaited)
+            try { await api(P(p, "/folders/name"), { method: "POST", body: { path: s.path, name: input.value } }); }
+            catch (err) { toast(err.message, { kind: "error" }); return; }
+            btn.textContent = "Named";
+            btn.disabled = true;
           } }, "Use"));
       })) : h("div", { class: "muted" }, "Every folder already has a descriptive name (or no events have been found yet)."));
   }
@@ -243,6 +245,8 @@ export function mount(root, ctx) {
   return {
     refresh: render,
     unmount() { child?.unmount?.(); },
+    // Back to a tab that draws after a fetch (Duplicates): it puts the scroll back once it has drawn.
+    restore: (s) => (child?.restore ? child.restore(s) : setTimeout(() => window.scrollTo({ top: s.y || 0, behavior: "instant" }), 120)),
     onKey(e) { return child?.onKey?.(e) || false; },
     get keys() { return child?.keys; },
   };

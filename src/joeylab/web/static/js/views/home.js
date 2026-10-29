@@ -310,6 +310,7 @@ export function mount(root, ctx) {
     return host;
   }
 
+  let toShots = false;                     // gone to the shot list once (⌘K), not on every redraw
   function shotListSection() {
     const host = h("section", { class: "section" }, h("h2", {}, "Shot list"), h("div", { class: "muted" }, "Loading…"));
     api(P(p, "/shotlist")).then((d) => {
@@ -344,6 +345,12 @@ export function mount(root, ctx) {
               await api(P(p, "/shotlist/preset"), { method: "POST", body: { kind: k } }); refreshShotList();
             } }, k[0].toUpperCase() + k.slice(1)))),
         add);
+      // From ⌘K's "Shot list": straight to it, ready to add a moment.
+      if (ctx.params.get("tab") === "shotlist" && !toShots) {
+        toShots = true;
+        host.scrollIntoView({ block: "start" });
+        title.focus({ preventScroll: true });
+      }
     }).catch((e) => { clear(host).append(h("h2", {}, "Shot list"), h("div", { class: "muted" }, e.message)); });
     function refreshShotList() { host.replaceWith(shotListSection()); }
     return host;

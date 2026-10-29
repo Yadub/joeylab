@@ -113,7 +113,7 @@ export function togglePick(ids, value) {
   // If every photo already has this state, clear it; otherwise set it.
   const all = ids.every((id) => (store.rows.get(id)?.pick || 0) === value);
   const pick = all ? 0 : value;
-  return decide(ids.map((id) => ({ id, pick })), pick === 1 ? "pick" : pick === -1 ? "reject" : "unflag");
+  return decide(ids.map((id) => ({ id, pick })), pick === 1 ? "pick" : pick === -1 ? "reject" : value === 1 ? "clear pick" : "clear reject");
 }
 /** Pick (1) or reject (-1): sets it, never clears it, so a second press or swipe changes nothing. */
 export function setPick(ids, value) {

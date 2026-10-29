@@ -8,9 +8,12 @@ stored in the catalog only (EXIF is never rewritten) and applied to the shared t
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 
@@ -33,6 +36,33 @@ def _vectors(conn) -> dict[int, np.ndarray]:
 _SUGGESTED: dict[str, tuple] = {}       # catalog -> (what it was worked out from, the suggestions)
 _WORKING: set[str] = set()
 _LOCK = threading.Lock()
+FILE = "clocks.json"     # the last suggestions, beside the catalog: after a restart Home doesn't wait seconds for them
+
+
+def _plain(stamp) -> list:
+    """A stamp as it reads back from the file (lists, not tuples or rows), so the two compare."""
+    return json.loads(json.dumps(stamp, default=list))
+
+
+def _kept(db_file: str) -> tuple | None:
+    try:
+        d = json.loads((Path(db_file).parent / FILE).read_text(encoding="utf-8"))
+        if d.get("format") == 1 and isinstance(d.get("suggestions"), list):
+            return d["stamp"], d["suggestions"]
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _keep(db_file: str, stamp: list, out: list) -> None:
+    path = Path(db_file).parent / FILE
+    tmp = path.with_name(f".{FILE}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            json.dump({"format": 1, "stamp": stamp, "suggestions": out}, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        tmp.unlink(missing_ok=True)
 
 
 def _inputs(conn) -> tuple:
@@ -52,8 +82,10 @@ def suggest(conn, project: str | None = None) -> list[dict]:
     Home and Tidy ask for them on every visit, and matching a big library's cameras takes seconds. With
     `project`, ones out of date are returned at once and worked out again in the background."""
     db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-    stamp = _inputs(conn)
+    stamp = _plain(_inputs(conn))
     hit = _SUGGESTED.get(db_file)
+    if hit is None and project and db_file and (hit := _kept(db_file)):
+        _SUGGESTED[db_file] = hit
     if hit and hit[0] == stamp:
         return [dict(x) for x in hit[1]]
     if hit and project:
@@ -65,6 +97,8 @@ def suggest(conn, project: str | None = None) -> list[dict]:
         return [dict(x) for x in hit[1]]
     out = _suggest(conn)
     _SUGGESTED[db_file] = (stamp, out)
+    if project and db_file:
+        _keep(db_file, stamp, out)
     return [dict(x) for x in out]
 
 
@@ -75,8 +109,9 @@ def _again(project: str, db_file: str) -> None:
         conn = db.connect(project, create=False)
         try:
             if conn.execute("PRAGMA database_list").fetchone()[2] == db_file:
-                stamp = _inputs(conn)
-                _SUGGESTED[db_file] = (stamp, _suggest(conn))
+                stamp = _plain(_inputs(conn))
+                _SUGGESTED[db_file] = (stamp, out := _suggest(conn))
+                _keep(db_file, stamp, out)
         finally:
             conn.close()
     except Exception:

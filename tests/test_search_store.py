@@ -105,3 +105,27 @@ def test_the_service_tidies_the_store_when_it_starts(env, monkeypatch):
     monkeypatch.setattr(_FakeModel, "embed_text", lambda self, text: None, raising=False)
     search.warm_up(delay=0)
     assert not list(folder.iterdir())
+
+
+def test_text_is_read_in_every_language_apple_vision_knows(monkeypatch):
+    """English first, then every other language Vision reads, with the language told from the text."""
+    from joeylab import search
+
+    class Ocr:
+        def __init__(self):
+            self.langs, self.auto = None, False
+
+        def supportedRecognitionLanguagesAndReturnError_(self, err):
+            return (["fr-FR", "en-US", "ja-JP"], None)
+
+        def setRecognitionLanguages_(self, langs):
+            self.langs = langs
+
+        def setAutomaticallyDetectsLanguage_(self, on):
+            self.auto = on
+
+    monkeypatch.setattr(search, "_OCR_LANGUAGES", None)
+    o = Ocr()
+    search._every_language(o)
+    assert o.langs == ["en-US", "fr-FR", "ja-JP"] and o.auto is True
+    assert search.INDEX_VERSION == "1"                   # photos read before aren't read again

@@ -242,7 +242,9 @@ SCORE_CHUNK = 4000
 
 def score(conn) -> int:
     """Write metrics.taste (0-1) for every present photo, a chunk at a time in float32 (so a
-    500k-photo library doesn't need gigabytes). Returns how many were scored."""
+    500k-photo library doesn't need gigabytes). Only scores that changed are written, a chunk to a
+    commit: writing every photo's in one go held the catalog's write lock for seconds, and other
+    changes (a decision from the phone) waited. Returns how many were scored."""
     if not _model_path().exists():
         conn.execute("UPDATE metrics SET taste = NULL")
         conn.commit()
@@ -265,7 +267,10 @@ def score(conn) -> int:
             conn.commit()
             return 0
         p = _predict((X - mu) / sd, w.astype(np.float32))
-        conn.executemany("UPDATE metrics SET taste=? WHERE shot_id=?", [(round(float(v), 4), r["id"]) for v, r in zip(p, rows)])
+        changed = [(t, r["id"]) for v, r in zip(p, rows) if (t := round(float(v), 4)) != r["taste"]]
+        if changed:
+            conn.executemany("UPDATE metrics SET taste=? WHERE shot_id=?", changed)
+            conn.commit()
         n += len(rows)
         after = rows[-1]["id"]
     conn.commit()

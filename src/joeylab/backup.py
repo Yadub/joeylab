@@ -7,11 +7,13 @@ SQLite's integrity check is never backed up over good copies.
 Most daily copies are "slim": they leave out the picture-search index, which is two thirds of a
 catalog and is rebuilt from the thumbnails after a restore. A full copy is made at least weekly
 (and whenever you ask), and the weekly and monthly keepers are full ones. Upgrade and manual
-copies are kept two at a time.
+copies are kept two at a time; the copies kept before a restore too, plus the first of them, which
+holds the catalog as it was before any restore.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from datetime import date, datetime
@@ -82,7 +84,8 @@ def _recent_full(d: Path) -> bool:
 
 def prune(project: str) -> list[Path]:
     """Thin out daily copies: keep 14 days, and the newest full copy of each of the last 8 weeks
-    and 12 months. Upgrade, restore and manual copies: the newest two of each kind."""
+    and 12 months. Upgrade, restore and manual copies: the newest two of each kind, and the first
+    copy kept before a restore."""
     files = sorted((p for p in _dir(project).glob("catalog-*.db") if _day(p)), key=lambda p: (_day(p), _is_full(p)))
     keep: set[Path] = set(files[-KEEP_DAILY:])
     weeks: dict[tuple, Path] = {}
@@ -100,10 +103,20 @@ def prune(project: str) -> list[Path]:
             removed.append(p)
     for prefix in ("pre-upgrade-", "before-restore-", "manual-"):
         others = sorted(_dir(project).glob(f"{prefix}*.db"), key=lambda x: x.stat().st_mtime)
+        if prefix == "before-restore-":
+            # By the time in the name: the first one holds the catalog as it was before any restore,
+            # which a later restore (of the wrong copy, say) must never push out.
+            others = sorted(others, key=_restore_order)[1:]
         for p in others[:-KEEP_OTHER]:
             p.unlink(missing_ok=True)
             removed.append(p)
     return removed
+
+
+def _restore_order(p: Path) -> tuple:
+    """before-restore-<time>.db, then -2, -3... for more restores in the same second."""
+    m = re.match(r"before-restore-(\d{8}-\d{6})(?:-(\d+))?\.db$", p.name)
+    return (m.group(1), int(m.group(2) or 1)) if m else (p.name, 0)
 
 
 def backup_all(force: bool = False) -> list[Path]:
@@ -147,7 +160,12 @@ def restore(project: str, source: Path | None = None) -> tuple[Path, Path | None
     catalog = config.project_dir(project) / "catalog.db"
     kept = None
     if catalog.exists():
-        kept = _dir(project) / f"before-restore-{time.strftime('%Y%m%d-%H%M%S')}.db"
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        kept = _dir(project) / f"before-restore-{stamp}.db"
+        for k in range(2, 100):                       # a second restore in the same second never writes over the first's
+            if not kept.exists():
+                break
+            kept = _dir(project) / f"before-restore-{stamp}-{k}.db"
         _dir(project).mkdir(parents=True, exist_ok=True)
         try:
             cur = sqlite3.connect(catalog)

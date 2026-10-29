@@ -18,12 +18,15 @@ from collections import Counter
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
-from ... import cleanup, copies, db, dupes as dupes_mod, library
-from ..deps import conn_dep, filter_from, ids_of, require_owner, viewer_of
+from ... import cleanup, copies, db, dupes as dupes_mod, library, locks
+from ..deps import conn_dep, filter_for, ids_of, require_owner, viewer_of
 from .library import browse_filter
 
 router = APIRouter()
 EXPIRE_S = 3600
+LOCK_WAIT_S = 1800                   # a move to the Trash waits this long for an update of the library to finish
+UPDATE_RUNNING = ("An update of this library was still running after half an hour, so nothing was moved. "
+                  "Try again when it finishes.")
 NOT_YOURS = {
     "assistant": "rejected by an assistant (open it in the Library and reject it yourself to include it)",
     "someone": "rejected by someone else (open it in the Library and reject it yourself to include it)",
@@ -167,7 +170,7 @@ def api_trash_plan(p: str, request: Request, body: dict = Body(default_factory=d
                 flt = library.Filter(ids=ids)
             else:
                 q = body.get("filter") or {}
-                flt = filter_from(q, viewer_of(request))
+                flt = filter_for(conn, q, viewer_of(request))
                 if str(q.get("all")) not in ("1", "true"):
                     flt = browse_filter(conn, flt)
             flt.picks, flt.undecided, flt.rejects = False, False, True      # only ever photos you rejected
@@ -245,23 +248,28 @@ def api_trash_run(p: str, token: str, request: Request, body: dict = Body(defaul
             return None if r and r[0] == -1 else "no longer rejected"
 
         try:
-            if job.what == "folders":
-                log = cleanup.trash_folders(job.folders, job.roots, f"{p}-folders")
-                moved = [f for f in job.folders if f.result == "moved to the Trash"]
-                job.result = {"moved": len(moved), "log": log,
-                              "left": [{"path": f.path, "why": f.result} for f in job.folders if f.result != "moved to the Trash"][:20]}
-            else:
-                log = cleanup.trash_files(job.items, go, f"{p}-files", still_wanted=still_rejected, conn=c)
-                moved = [i for i in go if i.result == "moved to the Trash"]
-                # The catalog already shows them gone (gone: the photos now missing), so no scan is
-                # needed; stacks, suggestions and events are made again without them.
-                job.result = {"moved": len(moved), "bytes": sum(i.size for i in moved), "log": log,
-                              "emptied": len(cleanup.emptied_by(go)), "gone": sorted({i.shot_id for i in go if i.photo_gone}),
-                              "left": [{"path": i.path, "why": i.result} for i in go if i.result != "moved to the Trash"][:20]}
-                if moved:
-                    bg.reorganise(p)
-                    reindex(c, p)
+            # The library's update lock, as moves take it: a scan running alongside would find a
+            # file gone half way and record it wrongly.
+            with locks.project_lock(p, wait=LOCK_WAIT_S):
+                if job.what == "folders":
+                    log = cleanup.trash_folders(job.folders, job.roots, f"{p}-folders")
+                    moved = [f for f in job.folders if f.result == cleanup.MOVED]
+                    job.result = {"moved": len(moved), "log": log,
+                                  "left": [{"path": f.path, "why": f.result} for f in job.folders if f.result != cleanup.MOVED][:20]}
+                else:
+                    log = cleanup.trash_files(job.items, go, f"{p}-files", still_wanted=still_rejected, conn=c)
+                    moved = [i for i in go if i.result == cleanup.MOVED]
+                    # The catalog already shows them gone (gone: the photos now missing), so no scan is
+                    # needed; stacks, suggestions and events are made again without them.
+                    job.result = {"moved": len(moved), "bytes": sum(i.size for i in moved), "log": log,
+                                  "emptied": len(cleanup.emptied_by(go)), "gone": sorted({i.shot_id for i in go if i.photo_gone}),
+                                  "left": [{"path": i.path, "why": i.result} for i in go if i.result != cleanup.MOVED][:20]}
+            if job.what != "folders" and moved:
+                bg.reorganise(p)
+                reindex(c, p)
             job.state = "done"
+        except locks.Busy:
+            job.state, job.error = "error", UPDATE_RUNNING
         except Exception as e:
             job.state, job.error = "error", str(e)
         finally:

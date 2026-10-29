@@ -72,6 +72,7 @@ class Filter:
     month: int | None = None           # taken in this month of any year (1-12)
     step: str | None = None            # the photos one step in the history changed
     ids: list[int] | None = field(default=None)
+    search: str | None = None       # a picture search (the Library's `q`): deps.with_search turns it into `ids`
     include_missing: bool = False
     readable: bool = False             # leave out files that couldn't be read as photos at all
 
@@ -217,6 +218,8 @@ class Filter:
                 a.append(v)
         if self.c2pa is not None:
             w.append("s.c2pa IS NOT NULL" if self.c2pa else "s.c2pa IS NULL")
+        if self.search is not None:
+            w.append("0")          # a picture search not yet turned into its matches: nothing, never everything
         if self.ids is not None:
             w.append(f"s.id IN ({','.join(str(int(i)) for i in self.ids) or 'NULL'})")
         return (" WHERE " + " AND ".join(w)) if w else "", a
@@ -308,15 +311,21 @@ def check_decision(rating=None, pick=None, label=None) -> tuple:
 
 
 def decide(conn, items: list[dict], what: str = "change", source: str = "web", viewer: str | None = None,
-           batch: str | None = None) -> tuple[str, list[int]]:
+           batch: str | None = None, commit: bool = True) -> tuple[str, list[int]]:
     """Apply decisions [{id, rating?, pick?, label?}] as one undoable step, logged. Values are checked
-    first (ValueError); photos that don't exist are skipped. Returns (batch id, ids that changed)."""
+    first (ValueError); photos that don't exist are skipped. What each photo has is read under the
+    write lock, so a star given elsewhere at the same moment isn't written over. commit=False leaves
+    the step in the caller's transaction (Undo, which reads under the same lock). Returns (batch id,
+    ids that changed)."""
     import uuid
+
+    from . import db
 
     checked = []
     for it in items:
         rating, pick, label = check_decision(it.get("rating"), it.get("pick"), it.get("label"))
         checked.append((int(it["id"]), rating, pick, label))
+    db.write_lock(conn)                   # read what each photo has, change it and log it, as one
     known = set()
     ids = [c[0] for c in checked]
     for k in range(0, len(ids), 500):
@@ -336,7 +345,8 @@ def decide(conn, items: list[dict], what: str = "change", source: str = "web", v
                      " VALUES (?,?,?,?,?,?,?,?)",
                      (now, batch, what, source, viewer, sid, json.dumps(before), json.dumps(after)))
         changed.append(sid)
-    conn.commit()
+    if commit:
+        conn.commit()
     return batch, changed
 
 
@@ -376,7 +386,7 @@ def _replay(conn, rows, back: bool, label: str, viewer: str | None, batch: str,
                 continue
             dating.apply(conn, sid, to["date"])
             conn.execute("INSERT INTO decision_log(ts, batch, label, source, viewer, shot_id, before, after) VALUES (?,?,?,?,?,?,?,?)",
-                         (now, batch, label, "undo", viewer, sid, json.dumps({"date": cur}), json.dumps({"date": to["date"]})))
+                         (now, batch, label, source, viewer, sid, json.dumps({"date": cur}), json.dumps({"date": to["date"]})))
             ids.append(sid)
             continue
         if "shift" in b:                      # a photo's own clock shift (dating.py)
@@ -388,7 +398,7 @@ def _replay(conn, rows, back: bool, label: str, viewer: str | None, batch: str,
                 continue
             dating.apply_shift(conn, sid, float(to["shift"] or 0))
             conn.execute("INSERT INTO decision_log(ts, batch, label, source, viewer, shot_id, before, after) VALUES (?,?,?,?,?,?,?,?)",
-                         (now, batch, label, "undo", viewer, sid, json.dumps({"shift": cur}), json.dumps({"shift": to["shift"]})))
+                         (now, batch, label, source, viewer, sid, json.dumps({"shift": cur}), json.dumps({"shift": to["shift"]})))
             ids.append(sid)
             continue
         if "raw" in b:                        # Keep RAW / RAW not needed (raws.py)
@@ -426,7 +436,7 @@ def _replay(conn, rows, back: bool, label: str, viewer: str | None, batch: str,
         if len(item) > 1:
             items.append(item)
     if items:
-        _, ch = decide(conn, items, what=label, source=source, viewer=viewer, batch=batch)
+        _, ch = decide(conn, items, what=label, source=source, viewer=viewer, batch=batch, commit=False)
         ids += ch
     return ids, skipped
 
@@ -437,6 +447,10 @@ def undo(conn, viewer: str | None = None, batch: str | None = None, source: str 
     reverses the redo. The undo is logged too, so the history shows it and Redo can reverse it.
     Returns {batch, label, ids, skipped} or None when there's nothing to undo. `source` limits it to
     changes from one place (the MCP server undoes only its own)."""
+    from . import db
+
+    began = not conn.in_transaction
+    db.write_lock(conn)                   # which step, what its photos have now, and the change, as one
     if batch is None:
         q = "SELECT batch FROM decision_log WHERE undone=0 AND source != 'undo'"
         args: list = []
@@ -448,12 +462,12 @@ def undo(conn, viewer: str | None = None, batch: str | None = None, source: str 
             args.append(source)
         row = conn.execute(q + " ORDER BY id DESC LIMIT 1", args).fetchone()
         if not row:
-            return None
+            return _release(conn, began)
         batch = row[0]
     rows = conn.execute("SELECT id, shot_id, before, after, label FROM decision_log WHERE batch=? AND undone=0 ORDER BY id DESC",
                         (batch,)).fetchall()
     if not rows:
-        return None
+        return _release(conn, began)
     import uuid
 
     ub = uuid.uuid4().hex[:12]            # the undo is one step in the history too
@@ -462,6 +476,12 @@ def undo(conn, viewer: str | None = None, batch: str | None = None, source: str 
     conn.execute("UPDATE decision_log SET undone=1 WHERE batch=?", (batch,))
     conn.commit()
     return {"batch": batch, "label": rows[0]["label"], "ids": [r["shot_id"] for r in rows], "skipped": skipped}
+
+
+def _release(conn, began: bool) -> None:
+    """Nothing to undo or redo: let go of the write lock (a caller's own transaction stays open)."""
+    if began:
+        conn.rollback()
 
 
 def _redo_target(conn, viewer: str | None = None):
@@ -483,14 +503,18 @@ def can_redo(conn, viewer: str | None = None) -> bool:
 def redo(conn, viewer: str | None = None) -> dict | None:
     """Reverse the latest Undo, straight after it (again leaving anything changed since alone). The
     redo is logged as a step of its own, which Undo reverses."""
+    from . import db
+
+    began = not conn.in_transaction
+    db.write_lock(conn)
     row = _redo_target(conn, viewer)
     if not row:
-        return None
+        return _release(conn, began)
     ub = row[0]
     rows = conn.execute("SELECT id, shot_id, before, after, label FROM decision_log WHERE batch=? ORDER BY id DESC",
                         (ub,)).fetchall()
     if not rows:
-        return None
+        return _release(conn, began)
     import uuid
 
     label = rows[0]["label"]

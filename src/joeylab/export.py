@@ -384,7 +384,8 @@ def write_sidecars(conn, flt: Filter, style: str = "stem", update_existing: bool
     Originals are never opened for writing. Existing sidecars are left alone unless
     update_existing is set. Then only the fields JoeyLab owns are changed, never lowering a
     rating or replacing a label another app set, and each sidecar is copied to
-    ~/.joeylab/xmp-backups first.
+    ~/.joeylab/xmp-backups first. One that can't be read just now is left alone (what another app
+    set in it is unknown), and one that fails is listed in errors while the rest go on.
     """
     from . import exif
 
@@ -418,52 +419,67 @@ def write_sidecars(conn, flt: Filter, style: str = "stem", update_existing: bool
     plan = [(s, (fpath + ".xmp") if len(owners[side.lower()]) > 1 else side, vals, ident)
             for s, side, vals, ident, fpath in plan]
     existing = [side for _, side, _, _ in plan if os.path.exists(side)]
-    theirs, _ = exif.read_many(existing, tags=["Rating", "Label"]) if (existing and update_existing) else ({}, set())
+    tool = exif.exiftool()
+    theirs, read = exif.read_many(existing, tags=["Rating", "Label"]) if (existing and update_existing and tool) else ({}, set())
     for s, side, vals, ident in plan:
-        if not os.path.exists(side):
-            with open(side, "x", encoding="utf-8") as fh:
-                fh.write(_new_sidecar(s, vals, ident, include))
-            res.written += 1
-            continue
-        if not update_existing:
-            res.skipped_existing += 1
-            continue
-        t = theirs.get(side, {})
-        args = []
-        rating, label = vals if vals else (None, None)
-        their_rating = t.get("Rating") if isinstance(t.get("Rating"), (int, float)) else None
-        if "rating" in include and rating is not None:
-            if their_rating is None or (rating > their_rating and their_rating >= 0) or (rating == -1 and their_rating <= 0):
-                if rating != their_rating:
-                    args.append(f"-XMP-xmp:Rating={rating}")
-            elif rating != their_rating:
-                res.kept_theirs += 1
-        if "label" in include and label:
-            if not t.get("Label"):
-                args.append(f"-XMP-xmp:Label={label}")
-            elif str(t.get("Label")).lower() != label.lower():
-                res.kept_theirs += 1
-        for tag, items in (("XMP-dc:Subject", ident["keywords"] if "keywords" in include else []),
-                           ("XMP-lr:HierarchicalSubject", ident.get("hierarchy") or [] if "keywords" in include else []),
-                           ("XMP-iptcExt:PersonInImage", ident["people"] if "people" in include else [])):
-            for kw in items:      # remove-then-add keeps each value once
-                args += [f"-{tag}-={kw}", f"-{tag}+={kw}"]
-        if not args:
-            res.skipped_existing += 1
-            continue
-        _backup_sidecar(side, backup_dir)
-        res.backup_dir = str(backup_dir)
-        tool = exif.exiftool()
-        if not tool:
-            res.errors.append(f"{side}: {exif.MISSING}")
-            continue
-        proc = subprocess.run([tool, "-q", "-overwrite_original", *args, side],
-                              env=exif.run_env(tool), capture_output=True, text=True)
-        if proc.returncode != 0:
-            res.errors.append(f"{side}: {(proc.stderr or proc.stdout).strip()[:200]}")
-        else:
-            res.updated += 1
+        try:
+            _write_one(res, s, side, vals, ident, include, update_existing, theirs, read, tool, backup_dir)
+        except OSError as e:             # this one couldn't be written (a drive gone, a name taken since): the rest go on
+            res.errors.append(f"{side}: {e.strerror or e}")
     return res
+
+
+def _write_one(res: XmpResult, s: dict, side: str, vals, ident: dict, include: tuple, update_existing: bool,
+               theirs: dict, read: set, tool: str | None, backup_dir: Path) -> None:
+    from . import exif
+
+    if not os.path.exists(side):
+        with open(side, "x", encoding="utf-8") as fh:
+            fh.write(_new_sidecar(s, vals, ident, include))
+        res.written += 1
+        return
+    if not update_existing:
+        res.skipped_existing += 1
+        return
+    if not tool:
+        res.errors.append(f"{side}: {exif.MISSING}")
+        return
+    if side not in read:
+        # What another app set in it is unknown (it couldn't be read just now), so nothing of
+        # theirs can be kept: it's left as it is.
+        res.errors.append(f"{side}: couldn't be read, so it was left as it is")
+        return
+    t = theirs.get(side, {})
+    args = []
+    rating, label = vals if vals else (None, None)
+    their_rating = t.get("Rating") if isinstance(t.get("Rating"), (int, float)) else None
+    if "rating" in include and rating is not None:
+        if their_rating is None or (rating > their_rating and their_rating >= 0) or (rating == -1 and their_rating <= 0):
+            if rating != their_rating:
+                args.append(f"-XMP-xmp:Rating={rating}")
+        elif rating != their_rating:
+            res.kept_theirs += 1
+    if "label" in include and label:
+        if not t.get("Label"):
+            args.append(f"-XMP-xmp:Label={label}")
+        elif str(t.get("Label")).lower() != label.lower():
+            res.kept_theirs += 1
+    for tag, items in (("XMP-dc:Subject", ident["keywords"] if "keywords" in include else []),
+                       ("XMP-lr:HierarchicalSubject", ident.get("hierarchy") or [] if "keywords" in include else []),
+                       ("XMP-iptcExt:PersonInImage", ident["people"] if "people" in include else [])):
+        for kw in items:      # remove-then-add keeps each value once
+            args += [f"-{tag}-={kw}", f"-{tag}+={kw}"]
+    if not args:
+        res.skipped_existing += 1
+        return
+    _backup_sidecar(side, backup_dir)
+    res.backup_dir = str(backup_dir)
+    proc = subprocess.run([tool, "-q", "-overwrite_original", *args, side],
+                          env=exif.run_env(tool), capture_output=True, text=True)
+    if proc.returncode != 0:
+        res.errors.append(f"{side}: {(proc.stderr or proc.stdout).strip()[:200]}")
+    else:
+        res.updated += 1
 
 
 def _backup_entries(backup_dir: Path) -> list[tuple[str, str]]:

@@ -4,13 +4,14 @@ A library's purpose decides how its photos are treated: a shoot is set up for cu
 tidying. A drive that holds both (wedding shoots among everyday photos) can be split: the wedding
 folders become a library of their own, with its own purpose, rules, people, events and decisions.
 
-Nothing is read again. Every catalog row about each photo whose files are under the chosen folders
-goes with it: the photo and its files, its measurements, colours and picture vectors, its faces with
-the people they're named as (and their other names), its keywords, decisions, RAW choices and dates
-given by hand with the history of all of those, its places in albums, favourites and comments, and
-its backups on other drives. Its thumbnails and previews go too (moved, never made again). Stacks,
-duplicates, events, trips, scores and taste are then worked out again in both libraries
-(`recompute`), as a normal background step.
+Nothing is read again. Every catalog row about each photo with a file under the chosen folders (or,
+for a missing photo, last seen there) goes with it: the photo and its files, its measurements, colours
+and picture vectors, its faces with the people they're named as (and their other names), its
+keywords, decisions, RAW choices, dates given by hand and time shifts with the history of all of
+those, its places in albums, favourites and comments, and its backups on other drives (the tables
+are listed in db.PER_PHOTO and db.PER_PHOTO_LINKED). Its thumbnails and previews go too (moved, never
+made again). Stacks, duplicates, events, trips, scores and taste are then worked out again in both
+libraries (`recompute`), as a normal background step.
 
 It's catalog only: no photo file is read, written, moved or renamed. A stop at any point leaves the
 library the photos came from as it was:
@@ -50,8 +51,7 @@ from . import config, db, libraries, locks
 
 PURPOSES = ("shoot", "archive")
 LEDGER = "moved_out"            # settings: the ids this library gave away by moves, {table: [[first, last], ...]}
-SIMPLE = ("metrics", "colours", "embeddings", "search_vecs", "vision", "captions", "decisions", "raw_choices",
-          "manual_dates", "viewer_decisions")      # one row (or a few) per photo, keyed by shot_id and nothing else
+SIMPLE = db.PER_PHOTO          # one row (or a few) per photo, keyed by shot_id and nothing else
 CACHED = ("thumbs", "thumbs_s", "previews", "previews/faces")
 _SKIP = object()
 
@@ -207,10 +207,20 @@ def _resolve(conn, src: str, raw: str, roots: list[str]) -> str:
 
 
 def _excluded_rows(conn) -> list[dict]:
+    for cols in ("folder, library, added, ino", "folder, library, added"):
+        try:
+            return [dict(r) for r in conn.execute(f"SELECT {cols} FROM excluded_folders ORDER BY folder")]
+        except sqlite3.OperationalError:          # a catalog not upgraded yet
+            continue
+    return []
+
+
+def _ino(folder: str) -> int | None:
+    """A folder's inode, by which it's followed when renamed or moved in Finder (scanner._walk)."""
     try:
-        return [dict(r) for r in conn.execute("SELECT folder, library, added FROM excluded_folders ORDER BY folder")]
-    except sqlite3.OperationalError:
-        return []
+        return db.to_i64(os.lstat(folder).st_ino)
+    except OSError:
+        return None
 
 
 def _unfinished(*names: str) -> dict | None:
@@ -302,17 +312,21 @@ def check(src: str, folders: list[str], dst: str, purpose: str | None = None) ->
 # ---------------------------------------------------------------- what moves
 
 def _moved(conn, folders: list[str]) -> dict[str, list[int]]:
-    """The photos whose files are under the folders (with every file of each), and their faces. Left in
-    temporary tables x_shots, x_files and x_faces of this connection."""
+    """The photos under the folders, with every file of each, and their faces: a photo with a file
+    there now, or a missing one that was last there (its folder). A photo whose files are elsewhere now
+    stays, even if a missing file of it was once under them. Files of no photo go by where they are.
+    Left in temporary tables x_shots, x_files and x_faces of this connection."""
     shots: set[int] = set()
     files: set[int] = set()
     for f in folders:
         lo, hi = _range(f)
-        shots |= {r[0] for r in conn.execute("SELECT id FROM shots WHERE dir = ? OR (dir >= ? AND dir < ?)", (f, lo, hi))}
-        for fid, sid in conn.execute("SELECT id, shot_id FROM files WHERE path >= ? AND path < ?", (lo, hi)):
-            files.add(fid)
-            if sid is not None:
-                shots.add(sid)
+        shots |= {r[0] for r in conn.execute(
+            "SELECT DISTINCT shot_id FROM files WHERE status = 'present' AND shot_id IS NOT NULL AND path >= ? AND path < ?",
+            (lo, hi))}
+        shots |= {r[0] for r in conn.execute(
+            "SELECT id FROM shots WHERE (dir = ? OR (dir >= ? AND dir < ?)) AND id NOT IN"
+            " (SELECT shot_id FROM files WHERE status = 'present' AND shot_id IS NOT NULL)", (f, lo, hi))}
+        files |= {r[0] for r in conn.execute("SELECT id FROM files WHERE shot_id IS NULL AND path >= ? AND path < ?", (lo, hi))}
     for t in ("x_shots", "x_files", "x_faces"):
         conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {t} (id INTEGER PRIMARY KEY)")
         conn.execute(f"DELETE FROM temp.{t}")
@@ -848,8 +862,8 @@ def _write_target(ct, cs, chk: dict, moved: dict, final_dir: Path, opid: str) ->
         ct.execute("DELETE FROM main.excluded_folders WHERE folder=?", (f,))
         for e in src_left_out:                  # parts of it that went to a third library stay out here too
             if _inside(e["folder"], f) and e["folder"] != f and e["library"] != chk["dst"]:
-                ct.execute("INSERT OR IGNORE INTO main.excluded_folders(folder, library, added) VALUES (?,?,?)",
-                           (e["folder"], e["library"], e["added"]))
+                ct.execute("INSERT OR IGNORE INTO main.excluded_folders(folder, library, added, ino) VALUES (?,?,?,?)",
+                           (e["folder"], e["library"], e["added"], e.get("ino")))
     _move_keyed_settings(cs, ct, chk["folders"], m_shots)
     _shot_list(cs, ct, new, m_shots, m_people)
 
@@ -1068,8 +1082,9 @@ def _remove_from_source(cs, chk: dict, moved: dict, maps: dict) -> dict:
         if f in roots:
             cs.execute("DELETE FROM roots WHERE id=?", (roots[f],))
         else:
-            cs.execute("INSERT INTO excluded_folders(folder, library, added) VALUES (?,?,?) ON CONFLICT(folder)"
-                       " DO UPDATE SET library=excluded.library, added=excluded.added", (f, chk["dst"], now))
+            cs.execute("INSERT INTO excluded_folders(folder, library, added, ino) VALUES (?,?,?,?) ON CONFLICT(folder)"
+                       " DO UPDATE SET library=excluded.library, added=excluded.added, ino=excluded.ino",
+                       (f, chk["dst"], now, _ino(f)))
     led = _ledger(cs)
     owed = led.setdefault(chk["dst"], {})
     for t in ("shots", "files", "faces", "decision_log", "groups", "events", "clusters", "people", "albums"):
@@ -1213,7 +1228,7 @@ def run(src: str, folders: list[str], dst: str, purpose: str | None = None, *, b
         final_dir = config.project_dir(dst)
         cs = db.connect(src, create=False)
         ct = None
-        renamed = False
+        renamed = committing = False
         try:
             say("Finding what goes")
             cs.execute("BEGIN IMMEDIATE")                       # nothing changes the source until the move is over
@@ -1258,6 +1273,11 @@ def run(src: str, folders: list[str], dst: str, purpose: str | None = None, *, b
             for i in range(0, len(lost), 500):              # read again at its next update
                 chunk = lost[i : i + 500]
                 ct.execute(f"UPDATE main.shots SET thumb=NULL, analyzed_fp=NULL WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+            # What finishing needs, written down before the other library commits: a stop from here on may
+            # leave it with its copy (`finish` then sees which).
+            op["maps"] = {k: _runs(v) for k, v in maps.items() if isinstance(v, dict) and v}
+            _save(op)
+            committing = True
             ct.commit()
             ct.execute("DETACH DATABASE s")
             if new:
@@ -1273,7 +1293,6 @@ def run(src: str, folders: list[str], dst: str, purpose: str | None = None, *, b
                 ct.close()
                 ct = None
             op["state"] = "copied"
-            op["maps"] = {k: _runs(v) for k, v in maps.items() if isinstance(v, dict) and v}    # to finish it after a stop
             _save(op)
             t = lap("commit", t)
             say(f"Removing them from “{src}”")
@@ -1293,9 +1312,13 @@ def run(src: str, folders: list[str], dst: str, purpose: str | None = None, *, b
                 except sqlite3.Error:
                     pass
             if op["state"] == "copying":
-                if new and not renamed:
-                    shutil.rmtree(stage, ignore_errors=True)
-                op["state"] = "failed"
+                if committing and _landed(op):     # the other library has its copy: `finish` takes it from here
+                    op["state"] = "copied"
+                else:                              # nothing was committed anywhere: the source is as it was
+                    if new and not renamed:
+                        shutil.rmtree(stage, ignore_errors=True)
+                    op["state"] = "failed"
+                    op.pop("maps", None)
                 _save(op)
             raise
         finally:
@@ -1370,19 +1393,102 @@ def include_again(project: str, folder: str) -> dict:
     return {"folder": folder, "library": row["library"]}
 
 
+def _landed(op: dict) -> bool:
+    """Whether the other library has its copy of a move's photos: it includes every one of the folders
+    now (before the move it included none of them)."""
+    if op["dst"] not in config.list_projects():
+        return False
+    theirs = libraries.claims().get(op["dst"])
+    return theirs is not None and all(
+        any(_inside(f, r) for r in theirs["roots"]) and not any(_inside(f, e) for e in theirs["excluded"])
+        for f in op["folders"])
+
+
+# What you make about photos (beside their files and analysis), compared when a stopped move is
+# finished: (table, the columns compared, which rows). Faces only by the names you gave them.
+_YOURS = [*((t, None, "shot_id IN ({xs})") for t in db.MADE_PER_PHOTO),
+          ("comments", None, "shot_id IN ({xs})"), ("shot_keywords", None, "shot_id IN ({xs})"),
+          ("decision_log", None, "shot_id IN ({xs})"), ("album_items", None, "shot_id IN ({xs}) OR file_id IN ({xf})"),
+          ("faces", ("id", "shot_id", "person_id"), "shot_id IN ({xs}) AND person_src = 'user'")]
+
+
+def _changed_since(cs, backup: str, folders: list[str], moved: dict) -> set:
+    """The moved photos (cs's x_ tables) whose decisions, keywords, dates, favourites, comments, album
+    places, face names or history differ from the copy of the source taken when the move began (`b`).
+    Empty when none did. Photos under the folders now that weren't then, or the other way round, count
+    as changed too."""
+    then = sqlite3.connect(backup)
+    try:
+        before = _moved(then, folders)
+    finally:
+        then.close()
+    if before["shots"] != moved["shots"] or before["files"] != moved["files"]:
+        return set(before["shots"]) ^ set(moved["shots"]) or {None}
+    xs, xf = "SELECT id FROM temp.x_shots", "SELECT id FROM temp.x_files"
+    out: set = set()
+    for table, cols, where in _YOURS:
+        where = where.format(xs=xs, xf=xf)
+        here, there = _has(cs, "main", table), _has(cs, "b", table)
+        if here and there:
+            have = set(_cols(cs, "b", table))
+            sel = ", ".join(f'"{c}"' for c in (cols or _cols(cs, "main", table)) if c in have)
+            for a, b in (("main", "b"), ("b", "main")):
+                out |= {r["shot_id"] for r in cs.execute(
+                    f'SELECT {sel} FROM {a}."{table}" WHERE {where} EXCEPT SELECT {sel} FROM {b}."{table}" WHERE {where}')}
+        elif here or there:
+            out |= {r[0] for r in cs.execute(f'SELECT shot_id FROM {"main" if here else "b"}."{table}" WHERE {where}')}
+    return out
+
+
+def _changed_refusal(op: dict, changed: set) -> str:
+    n = len(changed - {None})
+    who = "one of those photos has" if n == 1 else f"{n:,} of those photos have" if n else "some of those photos have"
+    if op.get("new"):
+        out = (f"This move made “{op['dst']}”, so remove that library (its Settings › Library › Remove this "
+               "library)")
+    else:
+        out = (f"Bring back the copy of its catalog taken just before the move (joeylab restore -p {op['dst']} "
+               f"--from {op.get('backups', {}).get(op['dst'], '…')}); that also undoes anything done in “{op['dst']}” since")
+    return (f"Since this move stopped, {who} changed in “{op['src']}” (decisions, keywords, dates, names or "
+            f"history), and “{op['dst']}” has them as they were before. Finishing it now would lose those changes, "
+            f"so nothing was removed. To keep them, take that copy out of “{op['dst']}” first. {out}. Then finish "
+            "this move again: it closes with nothing moved, and the folders can be moved again.")
+
+
+def _gone_already(cs, op: dict, moved: dict) -> bool:
+    """The photos left the source already: the move stopped just after it committed that."""
+    if moved["shots"] or moved["files"]:
+        return False
+    roots = {r[0] for r in cs.execute("SELECT path FROM roots")}
+    left = {r["folder"]: r["library"] for r in _excluded_rows(cs)}
+    return all(left.get(f) == op["dst"] or not any(_inside(f, r) for r in roots) for f in op["folders"])
+
+
 def finish(opid: str) -> dict:
     """Finish a move that stopped. After the other library had its copy but before the photos left the
     one they came from, both have them: the copy there is complete and checked, so they're removed
-    here, as the move would have, provided nothing else changed meanwhile. After that, only some of
-    their thumbnails and previews may have followed: the rest do now."""
+    here, as the move would have, provided nothing about them changed here since the move began
+    (compared with the copy of this catalog taken then): otherwise it's refused, since finishing would
+    lose that work, and says how to keep it. When the other library doesn't have the copy (the move
+    stopped before it was committed, or the copy was taken out of it since), the move closes with
+    nothing moved. After the photos left, only some of their thumbnails and previews may have
+    followed: the rest do now."""
     op = load(opid)
-    if op.get("state") == "copying":
-        op["state"] = "failed"              # nothing was committed anywhere: the source is as it was
-        _save(op)
-        return op
-    if op.get("state") not in ("copied", "removed"):
+    if op.get("state") not in ("copying", "copied", "removed"):
         raise Refused("That move isn't waiting to be finished.")
     src, dst = op["src"], op["dst"]
+    if op["state"] != "removed" and not _landed(op):
+        if op.get("new"):
+            shutil.rmtree(_staging() / op["id"], ignore_errors=True)
+        op["state"] = "failed"              # the source has the photos as they are; nothing moved
+        op.pop("maps", None)
+        _save(op)
+        return op
+    if op["state"] == "copying":
+        if "maps" not in op:
+            raise Refused("That move's log doesn't say where its photos went, so it can't be finished. Nothing was changed.")
+        op["state"] = "copied"              # it stopped just after the other library committed its copy
+        _save(op)
     maps: dict[str, dict[int, int]] = {}
     for t, runs in (op.get("maps") or {}).items():
         maps[t] = {}
@@ -1390,19 +1496,28 @@ def finish(opid: str) -> dict:
             maps[t].update(zip(range(a, a + n), range(b, b + n)))
     with locks.project_lock(src), locks.project_lock(dst):
         if op["state"] == "copied":
+            backup = (op.get("backups") or {}).get(src)
+            if not backup or not os.path.isfile(backup):
+                raise Refused(f"The copy of “{src}” taken when the move began isn't there any more, so whether those "
+                              "photos changed since can't be told. Nothing was removed.")
             cs = db.connect(src, create=False)
             try:
+                cs.execute("ATTACH DATABASE ? AS b", (backup,))
                 cs.execute("BEGIN IMMEDIATE")
                 moved = _moved(cs, op["folders"])
-                ct = db.connect(dst, create=False)
-                try:
-                    have = {r[0] for r in ct.execute("SELECT path FROM files")}
-                finally:
-                    ct.close()
-                paths = [r[0] for r in cs.execute("SELECT path FROM files WHERE id IN (SELECT id FROM temp.x_files)")]
-                if any(p not in have for p in paths):
-                    raise Refused(f"Some of those photos aren't in “{dst}”: “{src}” has changed since. Nothing was removed.")
-                _remove_from_source(cs, {"folders": op["folders"], "dst": dst}, moved, maps)
+                if not _gone_already(cs, op, moved):
+                    ct = db.connect(dst, create=False)
+                    try:
+                        have = {r[0] for r in ct.execute("SELECT path FROM files")}
+                    finally:
+                        ct.close()
+                    paths = [r[0] for r in cs.execute("SELECT path FROM files WHERE id IN (SELECT id FROM temp.x_files)")]
+                    if any(p not in have for p in paths):
+                        raise Refused(f"Some of those photos aren't in “{dst}”: “{src}” has changed since. Nothing was removed.")
+                    changed = _changed_since(cs, backup, op["folders"], moved)
+                    if changed:
+                        raise Refused(_changed_refusal(op, changed))
+                    _remove_from_source(cs, {"folders": op["folders"], "dst": dst}, moved, maps)
                 cs.commit()
             except BaseException:
                 if cs.in_transaction:

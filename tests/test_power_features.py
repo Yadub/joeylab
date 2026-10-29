@@ -127,6 +127,20 @@ def test_stack_frames_and_hidden_count(lib_web):
     assert client.get("/api/p/t/shots", params={"all": 1}).json()["hidden"] == 0
 
 
+def test_picture_search_says_how_many_photos_it_covers(lib_web, monkeypatch):
+    from joeylab import ai
+    from joeylab.web.routes import ai as r_ai
+
+    client, conn, lib, ids = lib_web
+    monkeypatch.setattr(r_ai, "_search_mod", lambda conn: None)          # no SigLIP index: CLIP's vectors
+    monkeypatch.setattr(ai, "available", lambda: True)
+    monkeypatch.setattr(ai, "search", lambda conn, text, limit: [])
+    r = client.get("/api/p/t/search", params={"q": "beach in 2023"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["engine"] == "clip" and d["indexed"] == 0 and d["photos"] == len(ids) and d["filter"]  # (none read yet)
+
+
 def test_search_pages_sorts_and_lists_every_match(lib_web, monkeypatch):
     client, conn, lib, ids = lib_web
     readable = sorted(i for stem, i in ids.items() if stem != "ONLY_RAW")      # (that RAW can't be read)

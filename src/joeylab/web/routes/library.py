@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from ... import __author__, __version__, config, copies, db, keywords as keywords_mod, library, locks, scanner, scoring, taste
 from ...library import Filter
-from ..deps import _int, big_json, cap, conn_dep, filter_from, ids_of, is_owner, is_writer, one, require_owner, require_writer, viewer_of
+from ..deps import _int, big_json, cap, conn_dep, filter_for, with_search, ids_of, is_owner, is_writer, one, require_owner, require_writer, viewer_of
 
 router = APIRouter()
 
@@ -63,14 +64,15 @@ def settings_of(conn) -> dict:
 # ------------------------------------------------------------ meta / projects
 @router.get("/api/meta")
 def api_meta(request: Request):
-    from ... import ai, exif
+    from ... import ai, exif, search
 
     jobs = request.app.state.jobs
     watcher = getattr(jobs, "watcher", None)
     owner = is_owner(request)
     # Folder names on this Mac (its home folder, where JoeyLab is installed) are the owner's alone.
     mine = {"home": str(Path.home()), "joeylab_bin": str(Path(sys.executable).parent / "joeylab")} if owner else {}
-    return {"ai": ai.available(), "ai_loaded": ai.Models.loaded(), "watch_minutes": jobs.watch_minutes,
+    # ai_loaded: a search won't wait for a model to load (picture search's, or CLIP's for a library without it).
+    return {"ai": ai.available(), "ai_loaded": search.Model.loaded() or ai.Models.loaded(), "watch_minutes": jobs.watch_minutes,
             "watching": watcher.status() if watcher else None, **mine,
             "viewer": viewer_of(request), "writer": is_writer(request), "owner": owner,
             "can_trash": owner and sys.platform == "darwin",
@@ -105,23 +107,46 @@ def api_projects(request: Request):
             out.append({"name": name, "error": str(e), "photos": 0, "picks": 0, "roots": []})
             continue
         try:
-            cover = conn.execute(
-                "SELECT s.id, s.analyzed_fp FROM shots s JOIN metrics m ON m.shot_id=s.id"
-                " LEFT JOIN decisions d ON d.shot_id=s.id WHERE s.status='present' AND s.thumb IS NOT NULL"
-                " ORDER BY COALESCE(d.rating,0) DESC, m.quality DESC LIMIT 1").fetchone()
             last = conn.execute("SELECT MAX(finished) FROM scans").fetchone()[0]
+            photos, picks, cover = _project_counts(name, conn)
             out.append({
-                "name": name,
-                "photos": one(conn, "SELECT COUNT(*) FROM shots WHERE status='present' AND (error IS NULL OR analyzed_fp IS NOT NULL)"),
-                "picks": one(conn, "SELECT COUNT(*) FROM decisions d JOIN shots s ON s.id=d.shot_id WHERE s.status='present' AND d.pick=1"),
+                "name": name, "photos": photos, "picks": picks,
                 "roots": [r[0] for r in conn.execute("SELECT path FROM roots")],
                 "purpose": db.get_setting(conn, "purpose"),
                 "last_scan": last,
-                "cover": {"id": cover[0], "v": library.version_tag(cover[1])} if cover else None,
+                "cover": cover,
                 "job": (j.as_dict() if (j := jobs.current(name)) else None),
             })
         finally:
             conn.close()
+    return out
+
+
+_PROJECT_COUNTS: dict[str, tuple] = {}     # library -> (its catalog and counts:gen, photos, picks, cover)
+
+
+def _project_counts(name: str, conn) -> tuple:
+    """A library's photos, picks and cover photo for the list of libraries, kept until its counts change
+    (db.COUNTS_GEN, read before them): on 75,000 photos they took 45 ms on every load of the list (the
+    cover 0.6 s the first time). A cover whose quality is scored again without a change to the counts
+    stays until the next one."""
+    path = conn.execute("PRAGMA database_list").fetchone()[2]
+    try:
+        key = (path, os.stat(path).st_ino, db.counter(conn, db.COUNTS_GEN))
+    except OSError:
+        key = None
+    hit = _PROJECT_COUNTS.get(name)
+    if key is not None and hit and hit[0] == key:
+        return hit[1:]
+    cover = conn.execute(
+        "SELECT s.id, s.analyzed_fp FROM shots s JOIN metrics m ON m.shot_id=s.id"
+        " LEFT JOIN decisions d ON d.shot_id=s.id WHERE s.status='present' AND s.thumb IS NOT NULL"
+        " ORDER BY COALESCE(d.rating,0) DESC, m.quality DESC LIMIT 1").fetchone()
+    out = (one(conn, "SELECT COUNT(*) FROM shots WHERE status='present' AND (error IS NULL OR analyzed_fp IS NOT NULL)"),
+           one(conn, "SELECT COUNT(*) FROM decisions d JOIN shots s ON s.id=d.shot_id WHERE s.status='present' AND d.pick=1"),
+           {"id": cover[0], "v": library.version_tag(cover[1])} if cover else None)
+    if key is not None:
+        _PROJECT_COUNTS[name] = (key, *out)
     return out
 
 
@@ -280,7 +305,7 @@ def browse_filter(conn, base: Filter | None = None) -> Filter:
     """What "everything" means when browsing: hides thumbnails/fragments (and utility shots) when
     the library is set to. Files that couldn't be read as photos at all are never shown or counted
     (Tidy › Health lists them)."""
-    f = base or Filter()
+    f = with_search(conn, base or Filter())
     f.readable = True
     s = settings_of(conn)
     hide = [x for x, on in (("tiny", s["hide_tiny"]), ("utility", s["hide_utility"]), ("duplicate", s["hide_duplicates"])) if on]
@@ -299,15 +324,76 @@ def without_extras(f: Filter) -> Filter:
     return f
 
 
-def duplicates_note(conn, q, viewer: str | None) -> dict | None:
-    """For the Library's note: how many extra copies match this filter, and whether they're hidden."""
+def duplicates_filter(conn, q, base: Filter) -> Filter | None:
+    """The extra copies a Library filter (`base`, from filter_for) matches, for the Library's note on
+    them; None when the filter is for flags already or shows everything."""
     if q.get("all") in ("1", "true") or q.get("flag"):
         return None
-    f = browse_filter(conn, filter_from(q, viewer))
+    f = browse_filter(conn, dataclasses.replace(base))
     f.no_flag = ",".join(x for x in (f.no_flag or "").split(",") if x and x != "duplicate") or None
     f.flag = "duplicate"
+    return f
+
+
+def duplicates_note(conn, q, viewer: str | None) -> dict | None:
+    """For the Library's note: how many extra copies match this filter, and whether they're hidden."""
+    f = duplicates_filter(conn, q, filter_for(conn, q, viewer))
+    if f is None:
+        return None
     w, a = f.sql()
     return {"hidden": bool(settings_of(conn)["hide_duplicates"]), "n": one(conn, f"SELECT COUNT(*) {library.LIGHT_FROM}{w}", a)}
+
+
+# Library counts kept until counts:gen moves, for filters on nothing else but what it follows (decisions,
+# flags and suggestions, whether a photo is present or could be read, photo or video): on a big library
+# a filter's counts take tens of milliseconds even in one pass, and a decision doesn't change most of them.
+_COUNTS: dict[tuple, tuple] = {}
+_COUNTS_LOCK = threading.Lock()
+_GEN_FIELDS = {"picks", "rejects", "undecided", "min_rating", "suggestion", "flag", "no_flag", "media", "readable",
+               "include_missing"}
+
+
+def _followed_by_gen(*filters: Filter | None) -> bool:
+    plain = Filter()
+    return all(f.name in _GEN_FIELDS or getattr(flt, f.name) == getattr(plain, f.name)
+               for flt in filters if flt is not None for f in dataclasses.fields(flt))
+
+
+def browse_counts(conn, shown: Filter, raw: Filter, dup: Filter | None, stack: bool = False,
+                  base: Filter | None = None) -> tuple[int, int, int | None]:
+    """The Library's counts in one pass over the photos (three counts used to read the library three
+    times): how many photos (or stacks) it shows; how many more the filter matches than browsing shows
+    (as hidden_by_browsing); and how many extra copies match (`dup`, from duplicates_filter: as
+    duplicates_note). `base` is a filter every one of them narrows, so the pass can use its indexes."""
+    agg = "COUNT(DISTINCT COALESCE(s.group_id, -s.id))" if stack else "COUNT(*)"
+    hides = not (raw.no_flag == shown.no_flag and raw.readable == shown.readable)
+    cols, args = [], []
+    for f, how in ((shown, agg), (raw if hides else None, agg), (dup, "COUNT(*)")):
+        if f is None:
+            cols.append("NULL")
+            continue
+        w, a = f.sql()
+        cols.append(f"{how} FILTER (WHERE {w.removeprefix(' WHERE ') or '1'})")
+        args += a
+    w, a = base.sql() if base is not None else ("", [])
+    q, args = f"SELECT {', '.join(cols)} {library.LIGHT_FROM}{w}", [*args, *a]
+    key = None
+    if _followed_by_gen(shown, raw, dup, base):
+        path = conn.execute("PRAGMA database_list").fetchone()[2]
+        try:                                    # (the counter before the counts; the file as it is now)
+            key = (path, os.stat(path).st_ino, db.counter(conn, db.COUNTS_GEN), q, tuple(args))
+        except OSError:
+            key = None
+        if (hit := _COUNTS.get(key)) is not None:
+            return hit
+    n, more, dups = conn.execute(q, args).fetchone()
+    out = (n, max(0, more - n) if hides else 0, dups)
+    if key is not None:
+        with _COUNTS_LOCK:
+            while len(_COUNTS) >= 64:
+                _COUNTS.pop(next(iter(_COUNTS)))
+            _COUNTS[key] = out
+    return out
 
 
 def hidden_by_browsing(conn, raw: Filter, shown: Filter, total: int | None, stack: bool = False) -> int:
@@ -323,19 +409,21 @@ def hidden_by_browsing(conn, raw: Filter, shown: Filter, total: int | None, stac
 
 
 def _faces_of(conn, sid: int) -> list[dict]:
-    """A photo's faces, each with its group's size and whether that group is a clear one person (so
-    the viewer can offer "name the whole group" only when it's safe to)."""
-    from ... import faces as faces_mod
+    """A photo's faces and pets, each with its group's size and whether that group is a clear one person
+    (or pet), so the viewer can offer "name the whole group" only when it's safe to. A face found on an
+    animal (pets.animal_faces) is left out: the animal is listed itself."""
+    from ... import faces as faces_mod, pets
 
     out = []
     for r in conn.execute(
             "SELECT f.id, f.x, f.y, f.w, f.h, f.px, f.closed, f.smile, f.sharp, f.cluster, f.person_id, pe.name, pe.kind,"
-            " g.faces AS group_faces, g.cohesion, g.sharp AS group_sharp"
+            " f.model = ? AS pet, g.faces AS group_faces, g.cohesion, g.sharp AS group_sharp"
             " FROM faces f LEFT JOIN people pe ON pe.id = f.person_id LEFT JOIN face_groups g ON g.cluster = f.cluster"
-            " WHERE f.shot_id=? ORDER BY f.x", (sid,)):
+            " WHERE f.shot_id=? AND NOT (COALESCE(f.kind, '') = 'pet' AND f.model != ?) ORDER BY f.x", (pets.MODEL, sid, pets.MODEL)):
         d = dict(r)
         coh, gs = d.pop("cohesion"), d.pop("group_sharp")
-        d["group_clear"] = faces_mod.clear_group(coh, gs)
+        d["pet"] = bool(d["pet"])
+        d["group_clear"] = pets.clear_group(coh) if d["pet"] else faces_mod.clear_group(coh, gs)
         out.append(d)
     return out
 
@@ -543,31 +631,77 @@ def api_on_this_day(p: str, conn=Depends(conn_dep)):
 @router.get("/api/p/{p}/timeline")
 def api_timeline(p: str, request: Request, conn=Depends(conn_dep)):
     """Photo counts per month (or year) for the grid's scrubber and section headers. Filters apply."""
-    flt = browse_filter(conn, filter_from(request.query_params, viewer_of(request)))
+    flt = browse_filter(conn, filter_for(conn, request.query_params, viewer_of(request)))
     w, a = flt.sql()
     rows = conn.execute(
         f"SELECT substr(s.capture_str, 1, 7) AS ym, COUNT(*) AS n {library.LIGHT_FROM}{w} GROUP BY ym ORDER BY ym", a).fetchall()
     return {"months": [{"month": r["ym"] or "undated", "n": r["n"]} for r in rows]}
 
 
+@router.get("/api/p/{p}/summary")
+def api_summary(p: str, request: Request, conn=Depends(conn_dep)):
+    """What the photos a Library filter shows are made of, for the Library's summary of anything shown
+    (a search's matches, a folder, a person): how many, when (by year, or by month within one year), who,
+    where, which events, cameras and folders, and how many are picked or rejected."""
+    q = request.query_params
+    flt = filter_for(conn, q, viewer_of(request))
+    if q.get("all") not in ("1", "true"):
+        flt = browse_filter(conn, flt)
+    w, a = flt.sql()
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS summary_ids (id INTEGER PRIMARY KEY)")
+    conn.execute("DELETE FROM temp.summary_ids")
+    conn.execute(f"INSERT INTO temp.summary_ids SELECT s.id {library.LIGHT_FROM}{w}", a)
+    sel = "temp.summary_ids x JOIN shots s ON s.id = x.id"
+    t = conn.execute(f"SELECT COUNT(*) AS n, MIN(s.capture_str) AS first, MAX(s.capture_str) AS last,"
+                     f" SUM(d.pick = 1) AS picks, SUM(d.pick = -1) AS rejects, SUM(COALESCE(s.media, 'photo') = 'video') AS videos,"
+                     f" SUM(s.capture_str IS NULL) AS undated FROM {sel} LEFT JOIN decisions d ON d.shot_id = s.id").fetchone()
+    years = {(r[0] or "")[:4] for r in conn.execute(f"SELECT DISTINCT substr(s.capture_str, 1, 4) FROM {sel}") if r[0]}
+    unit, width = ("month", 7) if len(years) <= 1 else ("year", 4)
+
+    def top(sql: str, limit: int = 8) -> list[dict]:
+        return [dict(r) for r in conn.execute(sql + f" ORDER BY n DESC LIMIT {limit}")]
+
+    out = {
+        "n": t["n"], "first": t["first"], "last": t["last"], "picks": t["picks"] or 0, "rejects": t["rejects"] or 0,
+        "videos": t["videos"] or 0, "undated": t["undated"] or 0, "unit": unit,
+        "when": [{"key": r[0], "n": r[1]} for r in conn.execute(
+            f"SELECT substr(s.capture_str, 1, {width}) AS k, COUNT(*) FROM {sel} WHERE s.capture_str IS NOT NULL GROUP BY k ORDER BY k")],
+        "people": top(f"SELECT pp.id, pp.name, COUNT(DISTINCT f.shot_id) AS n FROM temp.summary_ids x JOIN faces f ON f.shot_id = x.id"
+                      f" JOIN people pp ON pp.id = f.person_id WHERE pp.name IS NOT NULL AND NOT COALESCE(pp.hidden, 0) GROUP BY pp.id", 10),
+        "places": top(f"SELECT pl.id, pl.name, pl.country, COUNT(*) AS n FROM {sel} JOIN places pl ON pl.id = s.place_id GROUP BY pl.id"),
+        "events": top(f"SELECT e.id, e.name, COUNT(*) AS n FROM {sel} JOIN events e ON e.id = s.event_id"
+                      f" WHERE e.kind = 'event' AND NOT COALESCE(e.hidden, 0) GROUP BY e.id"),
+        "cameras": top(f"SELECT s.camera AS name, COUNT(*) AS n FROM {sel} WHERE s.camera IS NOT NULL GROUP BY s.camera"),
+        "folders": top(f"SELECT s.dir AS path, COUNT(*) AS n FROM {sel} GROUP BY s.dir"),
+    }
+    conn.execute("DELETE FROM temp.summary_ids")
+    return out
+
+
 # ------------------------------------------------------------ browsing
 @router.get("/api/p/{p}/shots")
 def api_shots(p: str, request: Request, conn=Depends(conn_dep)):
     q = request.query_params
-    raw = filter_from(q, viewer_of(request))
+    raw = filter_for(conn, q, viewer_of(request))
     if raw.backup and not q.get("offset"):
         copies.ensure(conn, p)                  # filtering by backups: from the latest the index knows
+    base = dataclasses.replace(raw)
     flt = raw if q.get("all") in ("1", "true") else browse_filter(conn, dataclasses.replace(raw))
     offset = max(0, _int(q.get("offset"), 0) or 0)
     stack = q.get("stack") in ("1", "true")
-    rows, total = library.page(conn, flt, sort=q.get("sort", "time"), offset=offset,
-                               limit=cap(_int(q.get("limit"), 200) or 200, 1000),
-                               stack=stack, with_total=offset == 0 or q.get("total") == "1")
+    rows, _ = library.page(conn, flt, sort=q.get("sort", "time"), offset=offset,
+                           limit=cap(_int(q.get("limit"), 200) or 200, 1000), stack=stack, with_total=False)
     # Duplicate extras have a note of their own; "N hidden" is the thumbnails and utility shots.
     if settings_of(conn)["hide_duplicates"] and flt is not raw:
         raw = without_extras(dataclasses.replace(raw))
-    return {"rows": rows, "total": total, "hidden": hidden_by_browsing(conn, raw, flt, total, stack),
-            "duplicates": duplicates_note(conn, q, viewer_of(request)) if offset == 0 else None}
+    total, hidden, dups = None, 0, None
+    if offset == 0 or q.get("total") == "1":
+        dup = duplicates_filter(conn, q, base) if offset == 0 else None
+        # The filter as asked holds every photo counted, unless it leaves out the extra copies the note counts.
+        narrows = "duplicate" not in (base.no_flag or "").split(",")
+        total, hidden, dups = browse_counts(conn, flt, raw, dup, stack, base if narrows else None)
+    note = {"hidden": bool(settings_of(conn)["hide_duplicates"]), "n": dups} if dups is not None else None
+    return {"rows": rows, "total": total, "hidden": hidden, "duplicates": note}
 
 
 @router.get("/api/p/{p}/offset")
@@ -575,7 +709,7 @@ def api_offset(p: str, request: Request, month: str, sort: str = "time", conn=De
     """Where a month starts in the Library's time-sorted listing (with its filters), so the scrubber
     jumps there without loading every page before it."""
     q = request.query_params
-    flt = filter_from(q, viewer_of(request))
+    flt = filter_for(conn, q, viewer_of(request))
     if q.get("all") not in ("1", "true"):
         flt = browse_filter(conn, flt)
     if month != "undated" and not re.fullmatch(r"\d{4}-\d{2}", month):
@@ -588,7 +722,7 @@ def api_frames(p: str, request: Request, body: dict = Body(default_factory=dict)
     """With bursts stacked, a selection of stacks stands for every matching frame in them: those
     frames' ids, for keywords, albums and favourites."""
     q = body.get("filter") or {}
-    flt = filter_from(q, viewer_of(request))
+    flt = filter_for(conn, q, viewer_of(request))
     if str(q.get("all")) not in ("1", "true"):
         flt = browse_filter(conn, flt)
     return {"ids": library.frames(conn, flt, ids_of(body.get("ids")) or [])}
@@ -601,7 +735,7 @@ def api_rows(p: str, ids: str, conn=Depends(conn_dep)):
 
 @router.get("/api/p/{p}/stacks")
 def api_stacks(p: str, request: Request, conn=Depends(conn_dep)):
-    flt = without_extras(browse_filter(conn, filter_from(request.query_params, viewer_of(request))))
+    flt = without_extras(browse_filter(conn, filter_for(conn, request.query_params, viewer_of(request))))
     prerender = getattr(request.app.state, "prerender", None)
     if prerender and is_writer(request):
         prerender.start(p, soon=True)          # culling: have the previews ready ahead of you
@@ -760,7 +894,7 @@ def api_set_date(p: str, request: Request, body: dict = Body(default_factory=dic
 
     ids = ids_of(body.get("ids"))
     if ids is None and body.get("filter") is not None:
-        ids = [r["id"] for r in library.shots(conn, browse_filter(conn, filter_from(body["filter"], viewer_of(request))))]
+        ids = [r["id"] for r in library.shots(conn, browse_filter(conn, filter_for(conn, body["filter"], viewer_of(request))))]
     try:
         res = dating.set_dates(conn, ids or [], body.get("date"), viewer=viewer_of(request))
     except ValueError as e:
@@ -779,7 +913,7 @@ def api_shift_time(p: str, request: Request, body: dict = Body(default_factory=d
 
     ids = ids_of(body.get("ids"))
     if ids is None and body.get("filter") is not None:
-        ids = [r["id"] for r in library.shots(conn, browse_filter(conn, filter_from(body["filter"], viewer_of(request))))]
+        ids = [r["id"] for r in library.shots(conn, browse_filter(conn, filter_for(conn, body["filter"], viewer_of(request))))]
     try:
         res = dating.shift_times(conn, ids or [], float(body.get("seconds") or 0), viewer=viewer_of(request))
     except (TypeError, ValueError) as e:
@@ -794,7 +928,7 @@ def api_shift_time(p: str, request: Request, body: dict = Body(default_factory=d
 def api_accept(p: str, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
     """Turn suggestions into picks/rejects for undecided photos matching the filter."""
     require_writer(request)
-    flt = browse_filter(conn, filter_from(body.get("filter") or {}, viewer_of(request)))
+    flt = browse_filter(conn, filter_for(conn, body.get("filter") or {}, viewer_of(request)))
     flt.undecided = True
     only = body.get("only")
     items = []
@@ -1042,7 +1176,7 @@ def api_bulk(p: str, request: Request, body: dict = Body(default_factory=dict), 
     undoable step: {filter: {...}, rating?, pick?, label?, keywords_add?, keywords_remove?, album?}.
     Returns {n, batch, ids}."""
     require_writer(request)
-    flt = browse_filter(conn, filter_from(body.get("filter") or {}, viewer_of(request)))
+    flt = browse_filter(conn, filter_for(conn, body.get("filter") or {}, viewer_of(request)))
     ids = [r["id"] for r in library.shots(conn, flt)]
     if body.get("count_only") or not ids:
         return {"n": len(ids), "batch": None, "ids": []}

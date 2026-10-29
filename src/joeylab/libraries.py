@@ -212,7 +212,7 @@ def describe(check: dict) -> str:
 
 def _own_logs(name: str) -> list[Path]:
     """The trash, put-back and move logs written for this library (by their names)."""
-    trash = re.compile(rf"^{re.escape(name)}-(files|folders|putback)-\d{{8}}-\d{{6}}\.tsv$")
+    trash = re.compile(rf"^{re.escape(name)}-(files|folders|putback)-\d{{8}}-\d{{6}}(?:-\d+)?\.tsv$")
     moved = re.compile(rf"^{re.escape(name)}-\d{{8}}-\d{{6}}-[0-9a-f]{{6}}(\.open)?\.jsonl$")
     out = []
     for d, pat in ((config.HOME / "trash-log", trash), (config.HOME / "move-log", moved)):

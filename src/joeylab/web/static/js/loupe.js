@@ -299,6 +299,8 @@ export function openLoupe({ ids, index = 0, onClose, onIndex, loadMore, total, z
   const overlayBtn = h("button", { class: "btn ghost hide-sm", title: "Overlays (O)", onclick: () => cycleOverlay() }, icon("overlay"), h("span", {}, "Overlay"));
   const albumBtn = h("button", { class: "btn ghost", title: "Add to an album (B)", "aria-label": "Add to album",
     onclick: (e) => addToAlbum({ ids: [cur()], anchor: e.currentTarget }) }, icon("album"), h("span", { class: "hide-sm" }, "Album"));
+  const moreBtn = h("button", { class: "btn ghost icon-only show-sm", title: "Label, overlays and similar photos", "aria-label": "More",
+    "aria-haspopup": "menu", "aria-expanded": "false", onclick: (e) => moreMenu(e.currentTarget) }, h("span", { "aria-hidden": "true" }, "⋯"));
   // (The filmstrip is for the mouse: ← → Home End do the same from the keyboard, and each photo is read out.)
   const film = h("div", { class: "film", tabindex: "-1", "aria-hidden": "true" });
 
@@ -306,15 +308,13 @@ export function openLoupe({ ids, index = 0, onClose, onIndex, loadMore, total, z
     h("div", { class: "loupe-top" },
       // The viewer's heading: the photo's name, when it was taken, the camera.
       h("div", { class: "loupe-title", role: "heading", "aria-level": "1" }, titleB, titleS),
-      h("div", { class: "right" }, counter,
+      h("div", { class: "right" }, counter, moreBtn,
         h("button", { class: "btn ghost icon-only", title: "Info (I)", "aria-label": "Toggle info", onclick: toggleInfo }, icon("info")),
         h("button", { class: "btn ghost icon-only", title: "Close (Esc)", "aria-label": "Close", onclick: () => close() }, icon("close")))),
     h("div", { class: "loupe-body" }, viewer, info),
     h("div", { class: "loupe-bar" }, barStars, pickBtn, rejBtn, favBtn, labelBtn, h("span", { class: "spacer" }),
       overlayBtn, albumBtn,
-      h("button", { class: "btn ghost hide-sm", title: "Find similar photos", onclick: () => {
-        close({ to: `#/p/${encodeURIComponent(p)}/search?similar=${cur()}` });
-      } }, icon("similar"), "Similar"),
+      h("button", { class: "btn ghost hide-sm", title: "Find similar photos", onclick: () => similar() }, icon("similar"), "Similar"),
       zc.el),
     film);
   clear(host).append(root);
@@ -347,36 +347,60 @@ export function openLoupe({ ids, index = 0, onClose, onIndex, loadMore, total, z
     flash(viewer, v === 1 ? "Picked" : "Rejected", v === 1 ? "pick" : "reject");
   }
 
-  function labelMenu(anchor) {
-    const r = row(cur()) || {};
-    // A menu: the arrows move through it, Esc closes it, and the keyboard goes back to Label.
+  /** A menu over the bar, above its button: the arrows move through it, Esc closes it, and the
+   * keyboard goes back to the button. `items(done)` makes its buttons. */
+  function barMenu(anchor, label, items) {
     const done = (refocus = true) => {
       menu.remove();
       anchor.setAttribute("aria-expanded", "false");
       document.removeEventListener("pointerdown", off);
       if (refocus) anchor.focus({ preventScroll: true });
     };
-    const off = (e) => { if (!menu.contains(e.target)) done(false); };
-    const menu = h("div", { class: "label-menu", role: "menu", "aria-label": "Colour label", onkeydown: (e) => {
-      const items = [...menu.querySelectorAll("button")];
-      const i = items.indexOf(document.activeElement);
+    const off = (e) => { if (!menu.contains(e.target) && !anchor.contains(e.target)) done(false); };
+    const menu = h("div", { class: "label-menu", role: "menu", "aria-label": label, onkeydown: (e) => {
+      const list = [...menu.querySelectorAll("button")];
+      const i = list.indexOf(document.activeElement);
       if (e.key === "Escape" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); done(); return; }
       if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
       e.preventDefault(); e.stopPropagation();
-      const to = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1 : i + (e.key === "ArrowDown" ? 1 : -1);
-      items[(to + items.length) % items.length].focus();
-    } }, Object.entries(LABEL_COLORS).map(([name, color], k) =>
-      h("button", { type: "button", role: "menuitemradio", "aria-checked": r.label === name ? "true" : "false", class: `menu-item ${r.label === name ? "on" : ""}`,
-        onclick: () => { setLabel([cur()], name); done(); } },
-        h("span", { class: "label-dot", style: { background: color } }), name, k < 4 ? h("kbd", {}, String(k + 6)) : null)),
-    h("button", { type: "button", role: "menuitemradio", "aria-checked": r.label ? "false" : "true", class: "menu-item", onclick: () => { setLabel([cur()], ""); done(); } }, "No label"));
+      const to = e.key === "Home" ? 0 : e.key === "End" ? list.length - 1 : i + (e.key === "ArrowDown" ? 1 : -1);
+      list[(to + list.length) % list.length].focus();
+    } }, items(done));
     const rect = anchor.getBoundingClientRect();
-    Object.assign(menu.style, { left: `${rect.left}px`, bottom: `${window.innerHeight - rect.top + 6}px` });
     root.append(menu);
+    // Lined up with its button and kept on the screen: above a button in the bar, under one at the top.
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - menu.offsetWidth - 8));
+    Object.assign(menu.style, { left: `${left}px` }, rect.top < window.innerHeight / 2
+      ? { top: `${rect.bottom + 6}px` } : { bottom: `${window.innerHeight - rect.top + 6}px` });
     anchor.setAttribute("aria-expanded", "true");
     (menu.querySelector('[aria-checked="true"]') || menu.firstChild).focus({ preventScroll: true });
     setTimeout(() => document.addEventListener("pointerdown", off), 0);
   }
+
+  function labelMenu(anchor) {
+    const r = row(cur()) || {};
+    barMenu(anchor, "Colour label", (done) => [
+      ...Object.entries(LABEL_COLORS).map(([name, color], k) =>
+        h("button", { type: "button", role: "menuitemradio", "aria-checked": r.label === name ? "true" : "false", class: `menu-item ${r.label === name ? "on" : ""}`,
+          onclick: () => { setLabel([cur()], name); done(); } },
+        h("span", { class: "label-dot", style: { background: color } }), name, k < 4 ? h("kbd", {}, String(k + 6)) : null)),
+      h("button", { type: "button", role: "menuitemradio", "aria-checked": r.label ? "false" : "true", class: "menu-item", onclick: () => { setLabel([cur()], ""); done(); } }, "No label")]);
+  }
+
+  /** On a phone, where the bar has no room for them: Label, the overlays and Similar (from ⋯ at the top). */
+  function moreMenu(anchor) {
+    const r = row(cur()) || {};
+    barMenu(anchor, "More", (done) => [
+      h("button", { type: "button", role: "menuitem", class: "menu-item", "aria-haspopup": "menu", onclick: () => { done(false); labelMenu(anchor); } },
+        r.label ? h("span", { class: "label-dot", style: { background: LABEL_COLORS[r.label] } }) : h("span", { class: "label-dot empty" }),
+        r.label ? `${r.label} label…` : "Label…"),
+      h("div", { class: "menu-sep", role: "separator" }),
+      ...OVERLAYS.map((o) => h("button", { type: "button", role: "menuitemradio", "aria-checked": st.overlay === o ? "true" : "false",
+        class: `menu-item ${st.overlay === o ? "on" : ""}`, onclick: () => { setOverlay(o); done(); } }, icon("overlay"), OVERLAY_NAMES[o])),
+      h("div", { class: "menu-sep", role: "separator" }),
+      h("button", { type: "button", role: "menuitem", class: "menu-item", onclick: () => { done(false); similar(); } }, icon("similar"), "Find similar photos")]);
+  }
+  const similar = () => close({ to: `#/p/${encodeURIComponent(p)}/search?similar=${cur()}` });
 
   function paintBar() {
     const r = row(cur()) || {};
@@ -502,7 +526,7 @@ export function openLoupe({ ids, index = 0, onClose, onIndex, loadMore, total, z
           m.aesthetic ? meter("Looks", Math.max(0, Math.min(1, (m.aesthetic - 4.6) / 1.6)), null, `How good it looks to the picture model: ${m.aesthetic.toFixed(2)} of 10`) : null)) : null,
       h("section", {}, h("h4", {}, "Keywords"), keywordBlock(cur(), d.keywords || [], () => paintInfo())),
       d.faces?.length ? h("section", {},
-        h("h4", {}, `People · ${d.faces.length}`),
+        h("h4", {}, `${d.faces.some((f) => f.pet) ? "People and pets" : "People"} · ${d.faces.length}`),
         h("div", { class: "row", style: { gap: "6px" } }, d.faces.map((f) => f.person_id > 0 ? h("a", {
           class: `face-chip ${f.closed ? "closed" : ""}`, title: f.name + (f.closed ? " · eyes closed" : ""),
           ...leave(lib(`person=${f.person_id}`)),
@@ -577,8 +601,9 @@ export function openLoupe({ ids, index = 0, onClose, onIndex, loadMore, total, z
   }
 
   // ------------------------------------------------------------ overlays (analysis only, pixels untouched)
-  function cycleOverlay() {
-    st.overlay = OVERLAYS[(OVERLAYS.indexOf(st.overlay) + 1) % OVERLAYS.length];
+  function cycleOverlay() { setOverlay(OVERLAYS[(OVERLAYS.indexOf(st.overlay) + 1) % OVERLAYS.length]); }
+  function setOverlay(o) {
+    st.overlay = o;
     setPref("overlay", st.overlay);
     paintOverlay();
     paintBar();

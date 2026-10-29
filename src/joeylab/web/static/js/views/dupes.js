@@ -34,14 +34,23 @@ export function mount(root, ctx) {
     sort: ctx.params.get("sort") || "space",
     open: new Set(),
   };
+  // The folder groups you opened stay open for this browser tab: Back from a photo or the Library
+  // finds them as you left them (and the page where it was scrolled to).
+  const openKey = `joeylab.dupes.open.${p}`;
+  try { st.open = new Set(JSON.parse(sessionStorage.getItem(openKey) || "[]")); } catch { /* private mode */ }
+  const keepOpen = () => { try { sessionStorage.setItem(openKey, JSON.stringify([...st.open])); } catch { /* private mode */ } };
   let data = null;
+  let drawing = [];                  // the first page of sets of each group drawn open
 
   const save = () => ctx.setParams({ tab: "dupes", dtab: st.tab, sort: st.sort, kinds: [...st.kinds].join(",") });
 
+  /** Fetch and draw; resolves once the groups left open have their sets too. */
   async function load() {
     try { data = await api(P(p, "/dupes/groups"), { params: { kinds: [...st.kinds].join(",") } }); }
     catch (e) { clear(page).append(h("div", { class: "result err" }, e.message)); return; }
+    drawing = [];
     render();
+    await Promise.all(drawing);
   }
 
   function rel(path) {
@@ -210,11 +219,12 @@ export function mount(root, ctx) {
         icon(open ? "up" : "down"));
       head.addEventListener("click", () => {
         st.open.has(key) ? st.open.delete(key) : st.open.add(key);
+        keepOpen();
         body.hidden = !st.open.has(key);
         head.setAttribute("aria-expanded", body.hidden ? "false" : "true");
         if (!body.hidden && !body.firstChild) loadSets(body, g);
       });
-      if (open) loadSets(body, g);
+      if (open) drawing.push(loadSets(body, g));
       return h("section", { class: "dup-group" }, head, body);
     }));
   }
@@ -266,7 +276,7 @@ export function mount(root, ctx) {
         h("span", { class: "muted" }, `Showing ${n(shown)} of ${plural(g.set_ids.length, "set")}. Rejecting and the list of extra copies cover them all.`),
         h("button", { class: "btn small", type: "button", onclick: more }, `Show ${n(Math.min(left, GROUP_PAGE))} more`)] : null);
     }
-    more();
+    return more();
   }
 
   // Reject the extra copies of whole sets at once (a folder group, or everything listed): the server
@@ -433,6 +443,8 @@ export function mount(root, ctx) {
     open: (el) => (el.querySelector(".dup-card img") || el.querySelector("a[href*='album=']"))?.click(),
   });
 
-  load();
-  return { refresh: load, onKey, keys: KEYS };
+  const first = load();
+  return { refresh: load, onKey, keys: KEYS,
+    // Back: the scroll goes back once the groups (and the sets of those left open) are drawn again.
+    restore: (s) => first.then(() => window.scrollTo({ top: s.y || 0, behavior: "instant" })) };
 }

@@ -104,7 +104,8 @@ export function rawActions(bar, grid, { filter }) {
       onclick: async () => choose(await which(), "keep") }, "Keep RAW"),
     h("button", { class: "btn ghost small", title: "Their RAWs can then go to the Trash; the photos stay, shown from their JPEGs (R in the viewer)",
       onclick: async () => choose(await which(), "remove") }, "Reject RAW"));
-  bar.insertBefore(group, bar.lastElementChild);       // before Deselect
+  if (bar.addGroup) bar.addGroup(group);              // (the selection bar places it: before Deselect)
+  else bar.insertBefore(group, bar.lastElementChild);
   return group;
 }
 

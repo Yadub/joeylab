@@ -487,10 +487,20 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
   max-width: calc(100vw - 32px); overflow-x: auto;
 }
 .selbar .n { font-weight: 600; margin-right: 6px; white-space: nowrap; }
+/* Narrow: the count and Deselect on a line of their own, the actions under them (scrolling sideways). */
+.selbar.compact { flex-direction: column; align-items: stretch; gap: 4px; padding: 6px 8px; overflow: hidden; }
+.selbar-head { display: flex; align-items: center; gap: 6px; padding-left: 6px; min-width: 0; }
+.selbar-head .spacer { flex: 1; }
+.selbar-head .linkish { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selbar-acts { display: flex; align-items: center; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.selbar-acts::-webkit-scrollbar { display: none; }
+.selbar-acts > * { flex: none; }
+.selbar-acts .label-pick { display: inline-flex; align-items: center; }
 .selbar .sep { width: 1px; height: 20px; background: var(--line); margin: 0 2px; flex: none; }
 
 /* culling and keys: "Picked 24 photos · Undo" sits above the selection bar, not over it */
 body:has(.selbar:not([hidden])) #toasts { bottom: 76px; }
+body:has(.selbar.compact:not([hidden])) #toasts { bottom: 128px; }
 
 /* ------------------------------------------------------------------ stage (loupe + cull): always a dark neutral */
 /* The palette's dark half (color-scheme), on the stage's own greys. */
@@ -1115,7 +1125,13 @@ a.health-card:hover { border-color: var(--accent); }
 .tree-row a b { font-weight: 500; }
 .tree-row .twisty { width: 22px; height: 22px; border: 0; background: none; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--muted); padding: 0; flex: none; }
 .tree-kids { padding-left: 18px; border-left: 1px solid var(--line); margin-left: 18px; }
-.active-filters .chip .icon { width: 12px; height: 12px; }
+.active-filters .chip .icon, .lib-chips .chip .icon { width: 12px; height: 12px; flex: none; }
+/* A long name (an event's, a folder's) wraps inside its chip rather than spilling out of it. */
+.active-filters .chip, .lib-chips .chip { height: auto; min-height: var(--control-h-sm); padding-block: 3px; text-align: left; max-width: 100%; }
+/* The filters in use, above the photos where the rail is off the screen (a phone, a narrow window). */
+.lib-chips { display: none; }
+@media (max-width: 900px) { .lib-chips:not([hidden]) { display: flex; flex-wrap: wrap; gap: 6px; margin: -2px 0 12px; } }
+@media (pointer: coarse) { .active-filters .chip, .lib-chips .chip { min-height: 44px; } }
 .people-chips .chip { height: 24px; font-size: var(--fs-sm); }
 .more-filters { display: grid; gap: 8px; }
 .more-filters summary { list-style: none; }
@@ -1527,10 +1543,14 @@ body:has(#view > .cull) .topbar {
   .cull-head .title { flex: 1 1 0; }
   .cull-head .right { order: 5; flex: 1 0 100%; margin-left: 0; flex-wrap: wrap; }
   .cull-head .progress { display: block; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; max-width: none; border-radius: 0; }
-  .cull-bar .bar-main { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  /* Two rows: Pick, Reject, Undo and Next; then Accept, the stars and the rest, scrolling sideways. */
+  .cull-bar { flex-wrap: wrap; row-gap: 6px; }
+  .cull-bar .bar-main { flex-wrap: nowrap; }
   .cull-bar .bar-main > * { flex: none; }
-  .cull-bar .bar-main::-webkit-scrollbar { display: none; }
-  .cull-bar .bar-main .spacer { flex: 0 0 4px; }
+  .cull-bar .bar-more { order: 3; flex: 1 0 100%; display: flex; align-items: center; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+  .cull-bar .bar-more[hidden] { display: none; }
+  .cull-bar .bar-more::-webkit-scrollbar { display: none; }
+  .cull-bar .bar-more > * { flex: none; }
 }
 .loupe-top .right .mono { white-space: nowrap; }
 /* The viewer's info panel sits beside the photo on a tablet and under it on a phone: it never covers it. */
@@ -1545,8 +1565,6 @@ body:has(#view > .cull) .topbar {
   .cull-head .stats .sep { display: none; }
   .cull-head .lbl { display: none; }
   .cull-head select.input { flex: 1 1 auto; min-width: 0; max-width: 150px; }
-  .cull-bar .bar-main > .pick-btn { order: 1; } .cull-bar .bar-main > .reject-btn { order: 2; } .cull-bar .bar-main > .clear-btn { order: 3; }
-  .cull-bar .bar-main > .keep-btn { order: 4; } .cull-bar .bar-main > .accept-btn { order: 5; } .cull-bar .bar-main > * { order: 6; }
   .cull-bar .keep-btn { white-space: nowrap; }
   .stage-flash { font-size: var(--fs-2xl); padding: 12px 20px; }
   .survey-cells[data-n="2"] { grid-template-columns: minmax(0, 1fr); }
@@ -1601,9 +1619,11 @@ body:has(#view > .cull) .topbar {
 .share-big .btn { position: fixed; top: 16px; right: 16px; }
 @media (max-width: 640px) { .share-tile { flex-basis: calc(var(--ar, 1.5) * 120px); } }
 
-/* small screens */
+/* small screens: .hide-sm goes, .show-sm (what stands in for it) comes */
+.show-sm { display: none !important; }
 @media (max-width: 640px) {
   .hide-sm { display: none !important; }
+  .show-sm { display: inline-flex !important; }
   .scrubber { right: 2px; }
   .lib-main:has(.scrubber:not([hidden])) { padding-right: 34px; }
   .event-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1834,3 +1854,21 @@ code, .mono, .path, .note, .result { overflow-wrap: anywhere; }
 .reading-steps li.done::before { content: "✓"; background: var(--pick-soft); border-color: var(--pick); color: var(--pick); }
 .reading-steps li.now { color: var(--ink); font-weight: 600; }
 .reading-steps li.now::before { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+
+/* The Library's summary of what's shown */
+.lib-summary { margin: 4px 0 16px; }
+.lib-summary .sum-head { margin: 0 0 10px; color: var(--ink-2); }
+.lib-summary .sum-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.lib-summary .sum-card { background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 12px 14px; min-width: 0; }
+.lib-summary h3 { margin: 0 0 8px; font-size: var(--fs-sm); font-weight: 600; color: var(--ink-2); }
+.lib-summary .sum-bars { display: grid; gap: 2px; max-height: 260px; overflow-y: auto; }
+.lib-summary .sum-bar { display: grid; grid-template-columns: 5.5em 1fr auto; align-items: center; gap: 8px; padding: 3px 4px;
+  border: 0; background: none; color: var(--ink); font: inherit; font-size: var(--fs-sm); text-align: left; border-radius: var(--radius-sm); cursor: pointer; }
+.lib-summary .sum-bar:hover { background: var(--sunken); }
+.lib-summary .sum-bar .track { height: 8px; border-radius: var(--radius-pill); background: var(--sunken); overflow: hidden; }
+.lib-summary .sum-bar .track i { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.lib-summary .sum-bar .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.lib-summary .chips .meta { margin-left: 6px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+@media (pointer: coarse) { .lib-summary .sum-bar { min-height: 44px; } }
+.summary-btn[aria-pressed="true"] { color: var(--accent); }
+@media (max-width: 1599px) { .summary-btn .lbl { display: none; } }

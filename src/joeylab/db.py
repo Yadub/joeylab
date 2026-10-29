@@ -551,9 +551,84 @@ CREATE INDEX IF NOT EXISTS files_shot_status ON files(shot_id, status, kind);
     _counts_triggers(conn)
 
 
+def _m17_dates_and_left_out(conn) -> None:
+    """Dates given by hand and each photo's own clock shift (dating.py) in every catalog, rather than
+    made when first used, so whatever carries a photo's rows (moving folders to another library) always
+    finds them; and the inode of each folder the library leaves out, so one renamed or moved in Finder
+    is still left out (scanner._walk)."""
+    from . import dating
+
+    conn.execute(dating.TABLE)
+    conn.execute(dating.SHIFTS)
+    _add_columns(conn, "excluded_folders", [("ino", "INTEGER")])
+
+
+# The tables the Library's counts and pages read, and how far the photo count may drift from the one
+# their statistics were taken at before they're taken again.
+STATS_TABLES = ("shots", "metrics", "decisions", "groups")
+STATS_DRIFT = 0.10
+
+
+def analyze_counted(conn) -> None:
+    """Fresh planner statistics for the photo tables, read in full. (PRAGMA optimize samples a few
+    thousand rows: on a big library it recorded that nearly every photo's status matched only 2,001 of
+    them, so whole-library counts walked the status index rather than reading the table once.)"""
+    for t in STATS_TABLES:
+        conn.execute(f"ANALYZE {t}")
+
+
+def refresh_stats(conn) -> bool:
+    """At the end of an update: take the photo tables' statistics again when the number of photos has
+    moved by more than STATS_DRIFT since they were taken (a big first update, or folders moved to
+    another library). True when it did. Takes well under a second on 75,000 photos."""
+    try:
+        row = conn.execute("SELECT stat FROM sqlite_stat1 WHERE tbl='shots' LIMIT 1").fetchone()
+    except sqlite3.OperationalError:          # never analysed: no statistics table yet
+        row = None
+    n = conn.execute("SELECT COUNT(*) FROM shots").fetchone()[0]
+    try:
+        was = int(str(row[0]).split()[0]) if row else None
+    except ValueError:
+        was = None
+    if not n or (was is not None and abs(n - was) <= STATS_DRIFT * max(was, 1)):
+        return False
+    analyze_counted(conn)
+    conn.commit()
+    return True
+
+
+def _m18_statistics(conn) -> None:
+    """Statistics for the photo tables taken in full (analyze_counted): whole-library counts read the
+    table once instead of the status index, and the picks filter starts from the decisions."""
+    analyze_counted(conn)
+
+
+ANIMALS = """
+CREATE TABLE IF NOT EXISTS animals (
+    shot_id INTEGER PRIMARY KEY,
+    src     TEXT NOT NULL,          -- analyzed_fp:pets.VERSION it was looked at from
+    found   TEXT,                   -- JSON [[dog | cat, confidence, x, y, w, h], ...]: boxes as fractions of the thumbnail
+    humans  TEXT                    -- JSON [[x, y, w, h], ...]: where Apple Vision sees a person
+);
+"""
+
+
+def _m19_pets(conn) -> None:
+    """Dogs and cats (pets.py): what Apple Vision found on each photo, with a stamp of its own, so a
+    library indexed for search before is only looked at for animals; and the faces of kind 'pet' (each
+    animal, grouped and named like a face, and faces the face models took for a person's) read from an
+    index, never from the faces' rows. Each face's capture quality (Apple Vision; faces.measure_quality)
+    and its photo's, with the faces still to judge found from an index of only those."""
+    _script(conn, ANIMALS)
+    conn.execute("CREATE INDEX IF NOT EXISTS faces_kind ON faces(kind, cluster)")
+    _add_columns(conn, "faces", [("quality", "REAL")])        # 0-1; below 0: couldn't be judged (or a pet)
+    _add_columns(conn, "metrics", [("face_quality", "REAL")])  # the main faces' quality, by their size
+    conn.execute("CREATE INDEX IF NOT EXISTS faces_unjudged ON faces(shot_id) WHERE quality IS NULL")
+
+
 MIGRATIONS = [_m1_columns, _m2_library, _m3_indexes, _m4_backfill, _m5_round5, _m6_round6, _m7_person_aliases,
               _m8_raw_choices, _m9_moves, _m10_trips, _m11_face_models, _m12_colours, _m13_event_names, _m14_backups,
-              _m15_excluded_folders, _m16_counts]
+              _m15_excluded_folders, _m16_counts, _m17_dates_and_left_out, _m18_statistics, _m19_pets]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -819,9 +894,23 @@ def set_setting(conn, key: str, value) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------- the tables about each photo
+#
+# Every table with rows about one photo (a shot_id column), so that whatever handles photos whole
+# handles all of them: moving folders to another library (split.py copies them), two photos found to be
+# one (scanner._merge_shot_data carries what you made) and photos forgotten (forget_computed,
+# scanner.prune_missing). A test checks that every table with a shot_id column is listed here.
+COMPUTED_PER_PHOTO = ("metrics", "colours", "embeddings", "search_vecs", "vision", "captions", "animals")    # worked out again if lost
+MADE_PER_PHOTO = ("decisions", "raw_choices", "manual_dates", "shot_offsets", "viewer_decisions")  # yours: never worked out again
+PER_PHOTO = COMPUTED_PER_PHOTO + MADE_PER_PHOTO          # keyed by shot_id and nothing else: copied as they are
+# Rows about a photo that point at other rows too (files, faces' people, keywords, albums, share links),
+# each handled by name: faces, comments, keywords, history, album places and backups move with a photo;
+# duplicate sets are worked out again; a share link's photos stay with the library that shared them.
+PER_PHOTO_LINKED = ("faces", "comments", "shot_keywords", "decision_log", "album_items", "backups", "dup_members",
+                    "share_photos")
+
 # Catalog rows computed about a photo (never the photo itself).
-SHOT_TABLES = ("metrics", "embeddings", "search_vecs", "vision", "captions", "viewer_decisions", "comments", "colours",
-               "backups")
+SHOT_TABLES = (*COMPUTED_PER_PHOTO, "viewer_decisions", "comments", "backups")
 
 
 def forget_computed(conn, ids: list[int]) -> None:

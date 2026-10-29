@@ -555,8 +555,13 @@ def export_xmp(project: Project = DEFAULT_PROJECT,
         console.print("This writes .xmp sidecar files next to your photos. Re-run with [bold]--write-sidecars[/] to confirm.")
         raise typer.Exit(1)
     conn = _conn(project)
-    r = export.write_sidecars(conn, Filter(), style=style, update_existing=update_existing,
-                              include=tuple(x.strip() for x in include.split(",") if x.strip()), project=project)
+    try:
+        with locks.project_lock(project, wait=1800):     # never while an update reads the same folders
+            r = export.write_sidecars(conn, Filter(), style=style, update_existing=update_existing,
+                                      include=tuple(x.strip() for x in include.split(",") if x.strip()), project=project)
+    except locks.Busy:
+        console.print(f"[yellow]An update of this library was still running after half an hour.[/] No sidecar was written.")
+        raise typer.Exit(1)
     console.print(f"Sidecars: {r.written} written, {r.updated} updated, {r.skipped_existing} existing left untouched"
                   + (f", {r.kept_theirs} kept another app's rating/label" if r.kept_theirs else ""))
     for e in r.errors[:5]:
@@ -829,9 +834,10 @@ def trash_list(listfile: Path, project: Project = DEFAULT_PROJECT,
         console.print("Stopped. Nothing was moved.")
         raise typer.Exit(1)
     try:
-        log = cleanup.trash_files(items, go, f"{project}-files", conn=conn)
-    except cleanup.Busy as e:
-        console.print(f"[yellow]{e}[/] Nothing was moved.")
+        with locks.project_lock(project, wait=1800):     # never while an update reads the same folders
+            log = cleanup.trash_files(items, go, f"{project}-files", conn=conn)
+    except (cleanup.Busy, locks.Busy) as e:
+        console.print(f"[yellow]{'An update of this library was still running after half an hour.' if isinstance(e, locks.Busy) else e}[/] Nothing was moved.")
         raise typer.Exit(1)
     moved = [i for i in go if i.result == "moved to the Trash"]
     console.print(f"[green]Moved {_count(len(moved), 'file')} ({_gb(sum(i.size for i in moved))}) to the Trash.[/]")
@@ -953,9 +959,10 @@ def raw_list(project: Project = DEFAULT_PROJECT,
         console.print("Stopped. Nothing was moved.")
         raise typer.Exit(1)
     try:
-        log = raws.trash(conn, items, f"{project}-files")
-    except cleanup.Busy as e:
-        console.print(f"[yellow]{e}[/] Nothing was moved.")
+        with locks.project_lock(project, wait=1800):     # never while an update reads the same folders
+            log = raws.trash(conn, items, f"{project}-files")
+    except (cleanup.Busy, locks.Busy) as e:
+        console.print(f"[yellow]{'An update of this library was still running after half an hour.' if isinstance(e, locks.Busy) else e}[/] Nothing was moved.")
         raise typer.Exit(1)
     done, size = raws.moved(items)
     console.print(f"[green]Moved {_count(len(done), 'RAW')} ({_gb(size)}) to the Trash. Their photos stay, shown from their JPEGs.[/]")
@@ -1004,9 +1011,10 @@ def empty_folders_cmd(project: Project = DEFAULT_PROJECT,
         console.print("Stopped. Nothing was moved.")
         raise typer.Exit(1)
     try:
-        log = cleanup.trash_folders(found, roots, f"{project}-folders")
-    except cleanup.Busy as e:
-        console.print(f"[yellow]{e}[/] Nothing was moved.")
+        with locks.project_lock(project, wait=1800):     # never while an update reads the same folders
+            log = cleanup.trash_folders(found, roots, f"{project}-folders")
+    except (cleanup.Busy, locks.Busy) as e:
+        console.print(f"[yellow]{'An update of this library was still running after half an hour.' if isinstance(e, locks.Busy) else e}[/] Nothing was moved.")
         raise typer.Exit(1)
     moved = [f for f in found if f.result == "moved to the Trash"]
     console.print(f"[green]Moved {_count(len(moved), 'folder')} to the Trash.[/]")
@@ -1219,8 +1227,8 @@ def serve(port: Annotated[int, typer.Option(help="Port (on this Mac, and on your
 
         from . import ai
 
-        if ai.available():  # load CLIP in the background so the first search is quick
-            threading.Thread(target=ai.Models.get, name="ai-warmup", daemon=True).start()
+        if ai.available():  # CLIP in the background, if a library's first search would wait for it
+            threading.Thread(target=ai.warm_up, name="ai-warmup", daemon=True).start()
         from . import search as _search
 
         if _search.available():  # and the picture-search model, which a first search used to wait for

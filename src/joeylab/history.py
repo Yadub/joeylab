@@ -3,8 +3,9 @@ filterable, with the photos each changed; and the moves to the Trash, read from 
 with Put Back for files still in the Trash.
 
 Put Back is the one place the app moves a file without a typed count, so it only ever undoes a
-move JoeyLab made: a file listed as moved in this library's own log, from the Trash to the exact
-path it came from, inside one of the library's folders, and never over anything that is there now.
+move JoeyLab made: a file listed as moved in this library's own log, still the very file that went
+(the same size, modified time and inode), from the Trash to the exact path it came from, inside one
+of the library's folders, never over anything that is there now, and never during an update.
 """
 
 from __future__ import annotations
@@ -79,22 +80,29 @@ def _logs_dir() -> Path:
 
 
 def _log_re(project: str):
-    return re.compile(rf"^{re.escape(project)}-(files|folders)-(\d{{8}}-\d{{6}})\.tsv$")
+    """A Trash log's name: <library>-files-<time>.tsv, with -2, -3... for a second run in the same second."""
+    return re.compile(rf"^{re.escape(project)}-(files|folders)-(\d{{8}}-\d{{6}})(?:-(\d+))?\.tsv$")
+
+
+def _int(v) -> int | None:
+    try:
+        return int(v) if v not in (None, "") else None
+    except ValueError:
+        return None
 
 
 def _read(path: Path, what: str) -> list[dict]:
-    """The moves a log lists: {path, now_at, bytes}."""
+    """The moves a log lists: {path, now_at, bytes, inode, mtime_ns}. Logs from before inode and
+    modified time were recorded have None for them."""
     out = []
     with open(path, encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh, delimiter="\t"):
             if row.get("result") != MOVED or not row.get("now at"):
                 continue
             path_key = "file" if what == "files" else "folder"
-            try:
-                size = int(row.get("bytes") or 0) if what == "files" else None
-            except ValueError:
-                size = None
-            out.append({"path": row.get(path_key) or "", "now_at": row["now at"], "bytes": size})
+            size = (_int(row.get("bytes") or 0)) if what == "files" else None
+            out.append({"path": row.get(path_key) or "", "now_at": row["now at"], "bytes": size,
+                        "inode": _int(row.get("inode")), "mtime_ns": _int(row.get("modified ns"))})
     return out
 
 
@@ -119,11 +127,12 @@ def trash_moves(project: str, limit: int = 60) -> list[dict]:
     """This library's moves to the Trash, newest first, each with what's still in the Trash."""
     pat = _log_re(project)
     d = _logs_dir()
-    logs = sorted((f for f in d.iterdir() if pat.match(f.name)), key=lambda f: pat.match(f.name).group(2),
+    logs = sorted((f for f in d.iterdir() if pat.match(f.name)),
+                  key=lambda f: (pat.match(f.name).group(2), int(pat.match(f.name).group(3) or 1)),
                   reverse=True) if d.is_dir() else []
     out = []
     for f in logs[:limit]:
-        what, stamp = pat.match(f.name).groups()
+        what, stamp, _ = pat.match(f.name).groups()
         try:
             items = _read(f, what)
         except (OSError, csv.Error, UnicodeDecodeError):
@@ -162,10 +171,13 @@ def _within(path: str, roots: list[str]) -> bool:
     return any(real == r or real.startswith(r + os.sep) for r in roots)
 
 
-def put_back(conn, project: str, log: str, paths: list[str] | None = None) -> dict:
+def put_back(conn, project: str, log: str, paths: list[str] | None = None, wait: float = 0.0) -> dict:
     """Move files (or folders) a Trash log lists back to where they were: only the ones still in the
-    Trash, only into this library's folders, never over something that is there now. A file put back
-    is shown again at once (the next update agrees). Returns {moved, results: [{path, result}], log}."""
+    Trash and still the very ones that went there, only into this library's folders, never over
+    something that is there now. A file put back is shown again at once (the next update agrees).
+    Holds the library's update lock (waiting up to `wait` seconds for an update to finish), so a scan
+    never sees it half done. Returns {moved, results: [{path, result}], log}."""
+    from . import locks
     from .cleanup import trash_lock
 
     m = _log_re(project).match(log or "")
@@ -179,37 +191,74 @@ def put_back(conn, project: str, log: str, paths: list[str] | None = None) -> di
         if not items:
             raise ValueError("Those aren't in that Trash log.")
     roots = [os.path.realpath(r[0]) for r in conn.execute("SELECT path FROM roots")]
-    scan = conn.execute("SELECT MAX(id) FROM scans").fetchone()[0]
     results, moved = [], 0
-    with trash_lock(wait=10):
-        for it in items:
-            src, dst = it["now_at"], it["path"]
-            if not os.path.lexists(src):
-                why = "not in the Trash any more"
-            elif not in_a_trash(src):
-                why = "left alone: it isn't in a Trash folder"
-            elif not os.path.isabs(dst) or not _within(dst, roots):
-                why = "left alone: that place isn't inside this library's folders"
-            elif what == "files" and it["bytes"] is not None and os.lstat(src).st_size != it["bytes"]:
-                why = "left alone: it has changed since it went to the Trash"
-            elif not os.path.isdir(os.path.dirname(dst)):
-                why = "left alone: the folder it came from isn't there any more"
-            elif os.path.lexists(dst):
-                why = "left alone: something else is at that place now"
-            else:
-                try:
-                    _rename_excl(src, dst)
-                    why = "put back"
-                except OSError as e:
-                    why = f"left alone: {e.strerror or e}"
-            if why == "put back":
-                moved += 1
-                if what == "files":
-                    _present(conn, dst, scan)
-            results.append({"path": dst, "result": why})
-    conn.commit()
+    try:
+        lock = locks.project_lock(project, wait=wait)
+        lock.__enter__()
+    except locks.Busy:
+        raise locks.Busy("An update of this library is running, so nothing was put back. Try again when it finishes.")
+    try:
+        scan = conn.execute("SELECT MAX(id) FROM scans").fetchone()[0]
+        with trash_lock(wait=10):
+            for it in items:
+                src, dst = it["now_at"], it["path"]
+                if not os.path.lexists(src):
+                    why = "not in the Trash any more"
+                elif not in_a_trash(src):
+                    why = "left alone: it isn't in a Trash folder"
+                elif not os.path.isabs(dst) or not _within(dst, roots):
+                    why = "left alone: that place isn't inside this library's folders"
+                elif not _same_as_moved(conn, src, it, what):
+                    why = ("left alone: what's in the Trash under that name isn't the file moved from there, "
+                           "or it has changed since")
+                elif not os.path.isdir(os.path.dirname(dst)):
+                    why = "left alone: the folder it came from isn't there any more"
+                elif os.path.lexists(dst):
+                    why = "left alone: something else is at that place now"
+                else:
+                    try:
+                        _rename_excl(src, dst)
+                        why = "put back"
+                    except OSError as e:
+                        why = f"left alone: {e.strerror or e}"
+                if why == "put back":
+                    moved += 1
+                    if what == "files":
+                        _present(conn, dst, scan)
+                results.append({"path": dst, "result": why})
+        conn.commit()
+    finally:
+        lock.__exit__(None, None, None)
     _log_put_back(project, results)
     return {"moved": moved, "results": results, "log": log}
+
+
+def _same_as_moved(conn, src: str, it: dict, what: str) -> bool:
+    """Whether what's in the Trash at `src` is the file (or folder) the log says went there, and
+    unchanged: never another of the same name moved to the Trash later (all of one camera's RAWs can
+    have one size). Logs record its size, modified time and inode; inode numbers are compared only
+    where the drive keeps real ones, and device numbers never (they change when a drive is plugged in
+    again). Older logs record only the size, so the catalog's record of the file at its old place
+    (kept, marked missing) stands in for the rest."""
+    from . import db
+    from .cleanup import real_ino
+
+    try:
+        st = os.lstat(src)
+    except OSError:
+        return False
+    if what == "folders":
+        return not real_ino(it["inode"]) or st.st_ino == it["inode"]
+    if it["bytes"] is not None and st.st_size != it["bytes"]:
+        return False
+    if it["mtime_ns"] is not None:
+        return st.st_mtime_ns == it["mtime_ns"] and (not real_ino(it["inode"]) or st.st_ino == it["inode"])
+    r = conn.execute("SELECT size, mtime_ns, ino FROM files WHERE path=?", (it["path"],)).fetchone()
+    if r is None:
+        return True                   # nothing in the catalog to compare with, and nothing of it to bring back
+    if (st.st_size, st.st_mtime_ns) != (r["size"], r["mtime_ns"]):
+        return False
+    return not (r["ino"] is not None and r["ino"] > 0) or db.to_i64(st.st_ino) == r["ino"]
 
 
 def _present(conn, path: str, scan: int | None) -> None:

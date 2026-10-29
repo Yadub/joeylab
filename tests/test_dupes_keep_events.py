@@ -194,6 +194,35 @@ def test_events_rename_merge_and_hide_hold_through_an_update(env):
     assert c.post(f"/api/p/t/events/{first['id']}/merge", json={"other": first["id"]}).status_code == 400
 
 
+def test_an_event_merge_can_be_undone(env):
+    from joeylab import events
+    from joeylab.web.server import create_app
+
+    _, lib = env
+    for day, place in ((1, "Beach"), (4, "Market"), (7, "Castle")):
+        for i in range(4):
+            jpeg_at(lib / place / f"IMG_{day}{i}.JPG", seed=day * 10 + i, when=f"2024:06:0{day} 1{i}:00:00")
+    add_root(lib)
+    conn, _ = run_all()
+    events.run(conn)
+    first, middle, last = sorted(events.listing(conn), key=lambda e: e["start_ts"])
+    c = TestClient(create_app())
+    c.post(f"/api/p/t/events/{middle['id']}/name", json={"name": "Market day"})
+    r = c.post(f"/api/p/t/events/{first['id']}/merge", json={"other": last["id"]}).json()
+    assert r["merged"] == 2 and len(r["undo"]["joins"]) == 2
+    merged = events.listing(conn)
+    assert len(merged) == 1 and not merged[0]["name"].startswith("Trip")      # an event is named as an event
+    back = c.post("/api/p/t/events/unmerge", json={"undo": r["undo"]})
+    assert back.status_code == 200 and back.json()["restored"] == 2
+    after = {e["id"]: (e["n"], e["name"]) for e in events.listing(conn)}
+    assert set(after) == {first["id"], middle["id"], last["id"]}
+    assert after[middle["id"]] == (4, "Market day") and after[first["id"]][0] == after[last["id"]][0] == 4
+    assert not events.joins(conn, "event")                                # the merge no longer holds...
+    events.run(conn)                                                      # ...so an update keeps them apart
+    assert {e["id"]: (e["n"], e["name"]) for e in events.listing(conn)} == after
+    assert c.post("/api/p/t/events/unmerge", json={"undo": "x"}).status_code == 400
+
+
 def test_library_hides_extras_in_archives_and_says_how_many(env):
     from joeylab import db
     from joeylab.web.server import create_app

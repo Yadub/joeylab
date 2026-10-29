@@ -51,6 +51,11 @@ function loadWorld() {
 
 // ------------------------------------------------------------------ shared with Events and Settings
 /** "Phuket, Thailand"; a country is just its name. */
+// Place id -> name, for the Library's filter chip (noted wherever places are listed).
+const names = new Map();
+export const placeName = (id) => names.get(String(id));
+export const notePlaces = (list) => (list || []).forEach((pl) => names.set(String(pl.id), pl.name));
+
 export const placeLabel = (pl) => (pl.kind === "country" || !pl.country || pl.country === pl.name ? pl.name : `${pl.name}, ${pl.country}`);
 const utc = (m) => `UTC${m < 0 ? "−" : "+"}${String(Math.floor(Math.abs(m) / 60)).padStart(2, "0")}:${String(Math.abs(m) % 60).padStart(2, "0")}`;
 
@@ -166,6 +171,7 @@ export function mount(root, ctx) {
   async function render() {
     try { d = await api(P(p, "/places")); } catch (e) { clear(page).append(h("div", { class: "result err" }, e.message)); return; }
     remember(d.rows);
+    d.countries.forEach((c) => notePlaces(c.places));
     const owner = store.meta?.owner !== false;
     const homeIds = new Set(d.homes.map((x) => x.id));
     const mapHost = h("div", { class: "map-host" });
@@ -177,6 +183,8 @@ export function mount(root, ctx) {
       h("div", { class: "page-head" },
         h("div", {}, h("h1", {}, "Places"),
           h("div", { class: "sub" }, !d.total ? (scanning ? "JoeyLab is still reading this library's photos." : "No photos in this library yet.")
+            // (Without the town list nothing is named yet, so "unknown" would be every photo.)
+            : !d.available && d.gps ? `${plural(d.gps, "photo")} with GPS, named once the town list is downloaded`
             : placed ? [`${plural(d.gps, "photo")} with GPS`, d.inferred ? `${n(d.inferred)} placed by the photos around them` : "",
               d.folder ? `${n(d.folder)} by their folder's name (a guess)` : "", d.manual ? `${n(d.manual)} by you` : "", `${n(d.unknown)} unknown`].filter(Boolean).join(" · ")
               : `${plural(d.total, "photo")}, none with a GPS position.`),

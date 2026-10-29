@@ -78,20 +78,34 @@ def _split(lines: dict, embs: dict, t: dict) -> list[tuple[str, list]]:
 
 
 _PREVIEW: dict[str, tuple] = {}
+PREVIEW_FILE = "grouping.json"    # the last preview, beside the catalog: kept across restarts too
 
 
 def preview(conn) -> dict:
     """What every strictness level would give, without changing anything: for the slider. Kept
-    until the photos' times, cameras, hashes or vectors change (not worked out on every visit)."""
+    until the photos' times, cameras, hashes or vectors change (not worked out on every visit, nor
+    again after a restart: it takes a second or two on a big library)."""
+    import json
+    import os
+    import threading
+    from pathlib import Path
+
     from .ai import load_embeddings
 
     db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-    stamp = (db.counter(conn, "emb_gen"), *conn.execute(
+    stamp = [db.counter(conn, "emb_gen"), *conn.execute(
         "SELECT COUNT(*), TOTAL(eff_ts), TOTAL(id * (time_src = 'file')), TOTAL(length(camera) + length(body_serial)),"
-        " TOTAL(CAST(substr(phash, 1, 6) AS INTEGER)) FROM shots WHERE status='present' AND phash IS NOT NULL").fetchone(),
+        " TOTAL(CAST(substr(phash, 1, 6) AS INTEGER)) FROM shots WHERE +status='present' AND phash IS NOT NULL").fetchone(),
         conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] if conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='embeddings'").fetchone() else 0)
+            "SELECT 1 FROM sqlite_master WHERE name='embeddings'").fetchone() else 0]
     hit = _PREVIEW.get(db_file)
+    path = Path(db_file).parent / PREVIEW_FILE if db_file else None      # (not for a catalog in memory)
+    if hit is None and path:
+        try:
+            kept = json.loads(path.read_text(encoding="utf-8"))
+            hit = _PREVIEW[db_file] = (kept["stamp"], {int(k): v for k, v in kept["levels"].items()})
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
     if hit and hit[0] == stamp:
         return hit[1]
     lines, _ = timeline(conn)
@@ -103,6 +117,14 @@ def preview(conn) -> dict:
         out[lv] = {"name": GROUPING_NAMES[lv], "stacks": len(sizes), "multi": len(multi),
                    "in_multi": sum(multi), "largest": max(sizes, default=0)}
     _PREVIEW[db_file] = (stamp, out)
+    if path:
+        tmp = path.with_name(f".{PREVIEW_FILE}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                json.dump({"stamp": stamp, "levels": out}, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError):
+            tmp.unlink(missing_ok=True)
     return out
 
 

@@ -15,15 +15,16 @@ import { albumDialog, decisionKey, keysDialog, selectionBar } from "./common.js"
 import { eventHeader, eventName } from "./events.js";
 import { exploreView } from "./explore.js";
 import { canMove, folderBar, folderMenu } from "./moves.js";
+import { notePlaces, placeName } from "./places.js";
 import { moveToLibrary } from "./splitlib.js";
 import { trashDialog } from "./trash.js";
 import { rawActions, rawFilterLabel, rawTrashDialog, RAW_SEG } from "./raws.js";
 import { waitNote } from "./waiting.js";
 
-const FILTER_KEYS = ["status", "min_rating", "suggested", "flag", "no_flag", "min_q", "max_q", "camera", "lens", "min_iso", "max_iso",
+export const FILTER_KEYS = ["status", "min_rating", "suggested", "flag", "no_flag", "min_q", "max_q", "camera", "lens", "min_iso", "max_iso",
   "min_focal", "max_focal", "max_f", "folder", "folder_like", "from", "to", "month", "person", "people", "cluster", "album", "no_album",
   "event", "trip", "place", "country", "gps", "media", "filetype", "label", "edited", "undated", "favs", "c2pa", "keyword", "not_keyword",
-  "untagged", "step", "raw", "backup", "ids", "all"];
+  "untagged", "step", "raw", "backup", "ids", "q", "all"];
 const list = (v) => (v ? String(v).split(",").filter(Boolean) : []);
 // The rail lists this many keywords before asking you to find the rest by name.
 const RAIL_KEYWORDS = 300;
@@ -46,8 +47,12 @@ export function mount(root, ctx) {
   const scrim = h("div", { class: "rail-scrim", onclick: () => openRail(false) });
   const wrap = h("div", { class: "lib" }, h("h1", { class: "sr-only" }, "Library"), rail, scrim, main);
   root.append(wrap);
+  // On a phone the rail is off the screen: the button says how many filters are on, and a row of
+  // chips above the photos shows them (each one removes its filter).
+  const filterLbl = h("span", {}, "Filters");
   const filterBtn = h("button", { class: "btn filter-toggle", type: "button", "aria-controls": "lib-filters", "aria-expanded": "false",
-    onclick: () => openRail(!wrap.classList.contains("rail-open")) }, icon("filter"), "Filters");
+    onclick: () => openRail(!wrap.classList.contains("rail-open")) }, icon("filter"), filterLbl);
+  const chipRow = h("div", { class: "chips lib-chips", role: "group", "aria-label": "Filters in use", hidden: true });
   function openRail(open) {
     wrap.classList.toggle("rail-open", open);
     filterBtn.setAttribute("aria-expanded", open ? "true" : "false");
@@ -66,6 +71,52 @@ export function mount(root, ctx) {
   store.libraryParams = filterParams();
   const sortNow = () => params.sort || store.prefs.sort;
   const trashSlot = h("span", { class: "trash-slot" });
+  // The summary of what's shown (when, who, where...), open by default when arriving with a search.
+  const summaryEl = h("section", { class: "lib-summary", "aria-label": "Summary of these photos", hidden: true });
+  const summaryOpen = () => store.prefs.summary ?? Boolean(params.q);
+  const summaryBtn = h("button", { class: "btn ghost summary-btn", type: "button", "aria-pressed": String(summaryOpen()), "aria-label": "Summary",
+    title: "Summary: when, who, where and what these photos are", onclick: () => { setPref("summary", !summaryOpen()); paintSummary(); } },
+  icon("chart"), h("span", { class: "lbl" }, "Summary"));
+  let summarySeq = 0;
+  async function paintSummary() {
+    summaryBtn.setAttribute("aria-pressed", String(summaryOpen()));
+    summaryEl.hidden = !summaryOpen() || lens !== "photos";
+    if (summaryEl.hidden) return;
+    const seq = ++summarySeq;
+    let s;
+    try { s = await api(P(ctx.project, "/summary"), { params: filterParams() }); } catch (e) { clear(summaryEl).append(h("div", { class: "result err" }, e.message)); return; }
+    if (seq !== summarySeq) return;
+    renderSummary(s);
+  }
+  function setRange(key, unit) {
+    const [y, m] = key.split("-").map(Number);
+    const last = unit === "month" ? new Date(y, m, 0).getDate() : 31;
+    params.from = unit === "month" ? `${key}-01` : `${key}-01-01`;
+    set("to", unit === "month" ? `${key}-${String(last).padStart(2, "0")}` : `${key}-12-31`);
+  }
+  function renderSummary(s) {
+    notePlaces(s.places);
+    const range = s.first && s.last ? (s.first.slice(0, 4) === s.last.slice(0, 4) ? s.first.slice(0, 4) : `${s.first.slice(0, 4)}–${s.last.slice(0, 4)}`) : "";
+    const facts = [plural(s.n, "photo"), range, s.videos ? plural(s.videos, "video") : "", s.picks ? plural(s.picks, "pick") : "",
+      s.rejects ? plural(s.rejects, "reject") : "", s.undated ? `${n(s.undated)} undated` : ""].filter(Boolean);
+    const card = (title, ...body) => h("div", { class: "sum-card" }, h("h3", {}, title), ...body);
+    const chips = (items, label, onPick) => h("div", { class: "chips" }, items.map((it) => h("button", { type: "button", class: "chip",
+      onclick: () => onPick(it), title: `Show only ${label(it)}` }, label(it), h("span", { class: "meta" }, n(it.n)))));
+    const max = Math.max(1, ...s.when.map((r) => r.n));
+    const cards = [
+      s.when.length ? card(s.unit === "year" ? "By year" : "By month", h("div", { class: "sum-bars" }, s.when.map((r) =>
+        h("button", { type: "button", class: "sum-bar", onclick: () => setRange(r.key, s.unit), title: `Show only ${s.unit === "year" ? r.key : monthLabel(r.key)}` },
+          h("span", { class: "k" }, s.unit === "year" ? r.key : monthLabel(r.key)),
+          h("span", { class: "track" }, h("i", { style: { width: `${Math.max(2, Math.round((r.n / max) * 100))}%` } })),
+          h("span", { class: "n" }, n(r.n)))))) : null,
+      s.people.length ? card("People", chips(s.people, (x) => x.name, (x) => set("person", x.id))) : null,
+      s.places.length ? card("Places", chips(s.places, (x) => x.name, (x) => set("place", x.id))) : null,
+      s.events.length ? card("Events", chips(s.events, (x) => x.name || "An event", (x) => set("event", x.id))) : null,
+      s.cameras.length ? card("Cameras", chips(s.cameras, (x) => x.name, (x) => set("camera", x.name))) : null,
+      s.folders.length ? card("Folders", chips(s.folders, (x) => x.path.split("/").filter(Boolean).slice(-2).join(" › "), (x) => set("folder", x.path))) : null,
+    ].filter(Boolean);
+    clear(summaryEl).append(h("p", { class: "sum-head" }, facts.join(" · ")), h("div", { class: "sum-cards" }, cards));
+  }
   const timeSorted = () => ["time", "time_desc"].includes(sortNow());
 
   let grid = null;
@@ -77,7 +128,7 @@ export function mount(root, ctx) {
     ctx.setParams(params);
     renderRail();
     paintTrash();
-    if (lens === "photos") grid?.reload();
+    if (lens === "photos") { grid?.reload(); paintSummary(); }
     else if (lens === "explore") explore?.setFilter(filterParams());
   }
 
@@ -104,23 +155,26 @@ export function mount(root, ctx) {
     onchange: (e) => { setPref("stack", e.target.checked); grid?.reload(); } });
   const headersBox = h("input", { type: "checkbox", id: "lib-headers", checked: store.prefs.headers,
     onchange: (e) => { setPref("headers", e.target.checked); grid?.reload(); } });
+  // (Its title says how many it saves once the grid has counted them.)
+  const albumBtn = h("button", { class: "btn ghost", onclick: () => albumDialog({ filter: filterParams(), name: "" }), title: "Save everything matching as an album" },
+    icon("album"), "Album…");
   const size = h("input", { type: "range", class: "size", id: "lib-size", min: 90, max: 380, step: 10, value: store.prefs.thumb,
     "aria-label": "Thumbnail size", oninput: (e) => { setPref("thumb", +e.target.value); grid?.relayout(); } });
   main.append(
     h("div", { class: "toolbar" },
       filterBtn,
-      count, hiddenChip, lensSeg,
+      count, hiddenChip, lensSeg, lens === "photos" ? summaryBtn : null,
       h("span", { class: "spacer" }),
       lens === "photos" ? [
         h("label", { class: "check hide-sm", title: "Month headings and a year scrubber" }, headersBox, h("span", {}, "Months")),
         h("label", { class: "check", title: "One photo per stack: frames shot together sit behind the best one" }, stack, h("span", {}, "Stacks")),
         sort, size,
         h("button", { class: "btn ghost hide-sm", onclick: () => grid.selectAll(), title: "Select all loaded (⌘A)" }, "Select all"),
-        h("button", { class: "btn ghost", onclick: () => albumDialog({ filter: filterParams(), name: "" }), title: "Save everything matching as an album" },
-          icon("album"), "Album…"),
+        albumBtn,
         h("button", { class: "btn ghost hide-sm", title: "A smart album keeps following this filter", onclick: smartAlbum }, icon("sparkle"), "Smart album"),
         trashSlot,
       ] : null),
+    chipRow,
     lens === "photos" ? h("div", { class: "keyhint" },
       // An archive is tagged and starred more than it's culled, so its hints lead with that.
       st.purpose === "archive" ? [
@@ -171,7 +225,8 @@ export function mount(root, ctx) {
     if (params.folder && !params.folder.includes("\n")) body.append(folderBar(params.folder, { isRoot: (store.overview?.roots || []).includes(params.folder),
       onDone: (r) => (r.folder ? set("folder", r.folder) : grid.reload()),
       toLibrary: () => moveToLibrary({ folders: [params.folder], onDone: () => { store.overview = null; set("folder", null); } }) }));
-    body.append(dupNote);
+    body.append(summaryEl, dupNote);
+    paintSummary();
     const paintDupNote = (d) => {
       dupNote.hidden = !d?.n;
       if (!d?.n) return;
@@ -211,6 +266,8 @@ export function mount(root, ctx) {
     offGrid = on((type, g) => {
       if (type === "grid" && g === grid) {
         count.textContent = plural(grid.total, store.prefs.stack ? "stack" : "photo");
+        albumBtn.title = !Object.keys(filterParams()).length ? "Save every photo in the library as an album"
+          : store.prefs.stack ? "Save every photo in these stacks as an album" : `Save all ${plural(grid.total, "photo")} as an album`;
         const hidden = grid.response?.hidden || 0;
         hiddenChip.hidden = !hidden;
         hiddenChip.textContent = `${n(hidden)} hidden`;
@@ -414,19 +471,28 @@ export function mount(root, ctx) {
       for (const k of kwTree) if (keywordPath(id)?.startsWith(k.path + " › ")) openKw.add(k.id);
     }
     const chosen = (k) => params[k];
+    // A place chosen elsewhere (a link, a reload): its name, from the summary of its photos.
+    if (params.place && !placeName(params.place)) {
+      try { notePlaces((await api(P(ctx.project, "/summary"), { params: { place: params.place } })).places); } catch { /* "A place" */ }
+    }
+    // Keywords and cameras can be several: one chip each, so each can go on its own.
+    const inUse = FILTER_KEYS.filter((k) => params[k] && k !== "all")
+      .flatMap((k) => (["keyword", "not_keyword", "camera"].includes(k) ? list(params[k]) : [params[k]]).map((v) => [k, v]));
+    const chip = ([k, v]) => h("button", { type: "button", class: "chip", "aria-pressed": "true", title: "Remove this filter",
+      onclick: () => set(k, list(params[k]).length > 1 ? list(params[k]).filter((x) => x !== v).join(",") : "") },
+    describe(k, v, o, peopleList), icon("close"));
+    const clearAll = () => h("button", { class: "btn ghost small reset", onclick: () => { FILTER_KEYS.forEach((k) => delete params[k]); set("status", ""); } }, "Clear all");
+    filterLbl.textContent = inUse.length ? `Filters · ${n(inUse.length)}` : "Filters";
+    filterBtn.setAttribute("aria-label", inUse.length ? `Filters, ${plural(inUse.length, "in use", "in use")}` : "Filters");
+    chipRow.hidden = !inUse.length;
+    clear(chipRow).append(inUse.length ? [...inUse.map(chip), clearAll()] : null);
     clear(rail).append(
       // The filters come first on the page: one key past them, to the photos.
       h("a", { class: "skip-link", href: "#", onclick: (e) => { e.preventDefault(); focusOn(grid?.el.querySelector(".grid") || body); } }, "Skip the filters"),
       h("div", { class: "rail-head" }, h("b", {}, "Filters"),
         h("button", { class: "btn small primary", type: "button", onclick: () => { openRail(false); filterBtn.focus(); } }, "Done")),
       active ? h("div", { class: "group active-filters" }, h("span", { class: "label" }, "Showing"),
-        // Keywords and cameras can be several: one chip each, so each can go on its own.
-        h("div", { class: "chips" }, FILTER_KEYS.filter((k) => params[k] && k !== "all").flatMap((k) =>
-          (["keyword", "not_keyword", "camera"].includes(k) ? list(params[k]) : [params[k]]).map((v) => h("button", {
-            type: "button", class: "chip", "aria-pressed": "true", title: "Remove this filter",
-            onclick: () => set(k, list(params[k]).length > 1 ? list(params[k]).filter((x) => x !== v).join(",") : "") },
-          describe(k, v, o, peopleList), icon("close"))))),
-        h("button", { class: "btn ghost small reset", onclick: () => { FILTER_KEYS.forEach((k) => delete params[k]); set("status", ""); } }, "Clear all")) : null,
+        h("div", { class: "chips" }, inUse.map(chip)), clearAll()) : null,
       h("div", { class: "group" }, h("span", { class: "label" }, "Show"),
         seg("status", [["", "All"], ["undecided", "Undecided"], ["picks", "Picks"], ["rejects", "Rejects"], ["rated", "Rated"]], "Show")),
       h("div", { class: "group" }, h("span", { class: "label" }, "At least"),
@@ -513,8 +579,11 @@ export function mount(root, ctx) {
   };
 }
 
+/** A filter in words, for its chip: "Has GPS", "ISO from 100", "Portugal". */
 function describe(k, v, o, peopleList) {
   const person = (id) => peopleList.people.concat(peopleList.hidden || []).find((x) => String(x.id) === String(id))?.name || "Someone";
+  const yes = ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
+  const num = (x) => String(+x || x);       // ISO 3200, not 3,200
   switch (k) {
     case "status": return { undecided: "Undecided", picks: "Picks", rejects: "Rejects", rated: "Rated" }[v] || v;
     case "min_rating": return `${"★".repeat(+v)}+`;
@@ -527,27 +596,48 @@ function describe(k, v, o, peopleList) {
     case "raw": return rawFilterLabel(v);
     case "month": return `${monthLabel(`2000-${String(v).padStart(2, "0")}`).replace(/\s*2000$/, "")}, any year`;
     case "step": return "Changed in one step";
-    case "ids": return `${plural(v.split(",").length, "photo")} chosen in Explore`;
-    case "camera": return v;
+    case "ids": return plural(v.split(",").filter(Boolean).length, "chosen photo");
+    case "camera": {
+      const c = (o?.cameras || []).find((x) => String(x.serial) === v);
+      return c ? `${c.camera} …${String(c.serial).slice(-4)}` : v;
+    }
+    case "lens": return `Lens: ${v}`;
+    case "min_iso": return `ISO from ${num(v)}`;
+    case "max_iso": return `ISO up to ${num(v)}`;
+    case "min_focal": return `From ${num(v)} mm`;
+    case "max_focal": return `Up to ${num(v)} mm`;
+    case "max_f": return `f/${v} or wider`;
+    case "min_q": return `Quality ≥ ${v}`;
     case "max_q": return `Quality ≤ ${v}`;
     case "flag": return v.split(",").map(flagLabel).join(" or ");
-    case "no_flag": return `Not ${v}`;
+    case "no_flag": return `Not ${v.split(",").map((f) => flagLabel(f).toLowerCase()).join(" or ")}`;
     case "person": return person(v);
     case "people": return v.split(",").map(person).join(" + ");
+    case "cluster": return "One unnamed face group";
     case "folder": return v.split("\n").map((x) => x.split("/").pop()).join(" or ");
+    case "folder_like": return `Folder name has “${v}”`;
+    case "q": return `Search: “${v}”`;
     case "from": return `From ${v}`;
     case "to": return `Until ${v}`;
-    case "favs": return v === "me" ? "Your favourites" : `${v}'s favourites`;
+    case "favs": return v === "me" || yes ? "Your favourites" : `${v}'s favourites`;
     case "album": return albumName(v) ? `Album “${albumName(v)}”` : "An album";
     case "event": return eventName(v) || "An event";
     case "trip": return eventName(v) || "A trip";
-    case "place": return "A place";
+    case "place": return placeName(v) || "A place";
+    case "country": return countryName(v);
     case "media": return v === "video" ? "Videos" : "Photos";
     case "label": return `${v} label`;
-    case "min_q": return `Quality ≥ ${v}`;
-    case "gps": return "Has GPS";
-    case "c2pa": return "Content Credentials";
+    case "gps": return yes ? "Has GPS" : "No GPS";
+    case "edited": return yes ? "Edited" : "Not edited";
+    case "undated": return yes ? "Undated" : "Dated";
+    case "c2pa": return yes ? "Content Credentials" : "No Content Credentials";
     case "backup": return { elsewhere: "Has a backup on another drive", checked: "Backup checked byte for byte", only: "Only on this drive" }[v] || v;
     default: return `${k}: ${v}`;
   }
+}
+
+/** "PT" -> "Portugal" (in the browser's language); a name stays as it is. */
+function countryName(v) {
+  if (!/^[A-Za-z]{2}$/.test(v)) return v;
+  try { return new Intl.DisplayNames(undefined, { type: "region" }).of(v.toUpperCase()) || v; } catch { return v; }
 }

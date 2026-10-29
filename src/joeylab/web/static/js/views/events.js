@@ -6,7 +6,7 @@ import { thumbButton } from "../grid.js";
 import { openLoupe } from "../loupe.js";
 import { mapsLink } from "../maps.js";
 import { remember, row, store } from "../store.js";
-import { ask, choiceSeg, clear, closePopover, dateRange, dialog, eventSub, h, icon, n, plural, popover, toast } from "../ui.js";
+import { ask, choiceSeg, clear, closePopover, dateRange, dialog, dismissToast, eventSub, h, icon, n, plural, popover, toast } from "../ui.js";
 import { groupKeys } from "./common.js";
 import { groupRawsDialog } from "./raws.js";
 import { placeLabel, placesSettingsHref, placeWhy, ruleText, townSearch, whenTripsFound } from "./places.js";
@@ -113,7 +113,7 @@ export async function mergeEvent(e, onChange) {
   });
   const box = h("div", { class: "stack-v merge-list" }, options);
   dialog(`Merge “${e.name}” with…`, h("div", { class: "stack-v" },
-    h("p", { class: "note" }, `The ${word[1]} just before and after it. They become one, ${e.user_named ? `called “${e.name}”` : "named from all their photos (rename it afterwards if you like)"}, and stay one after every update. Any ${word[1]} between the two join too.`),
+    h("p", { class: "note" }, `The ${word[1]} just before and after it. They become one, ${e.user_named ? `called “${e.name}”` : "named from all their photos (rename it afterwards if you like)"}, and stay one after every update. Any ${word[1]} between the two join too. You can undo it straight after.`),
     box), [
     { label: "Cancel" },
     { label: "Merge", primary: true, submit: true, run: async () => {
@@ -121,12 +121,34 @@ export async function mergeEvent(e, onChange) {
       if (!other) return false;
       try {
         const r = await api(P(p, `/events/${e.id}/merge`), { method: "POST", body: { other } });
-        toast(`Merged ${plural(r.merged, word[0], word[1])} into “${e.name}”`);
+        // Undo takes the merge back: each comes back with its own name, and events are found again.
+        const unmerge = async () => {
+          try {
+            await api(P(p, "/events/unmerge"), { method: "POST", body: { undo: r.undo } });
+            toast(`They're apart again. Finding ${word[1]} again…`, { key: "unmerge" });
+            onChange?.();
+            whenTripsFound(p, () => { dismissToast("unmerge"); onChange?.(); });
+          } catch (err) { toast(err.message, { kind: "error" }); }
+        };
+        toast(`Merged ${plural(r.merged, word[0], word[1])} into “${e.name}”`, { action: unmerge, actionLabel: "Undo", ms: 10000 });
         onChange?.();
       } catch (err) { toast(err.message, { kind: "error" }); return false; }
     } },
   ]);
 }
+
+/** A link to view (only) this event or trip, copied. */
+export async function shareEvent(e) {
+  try {
+    const r = await api(P(store.project, "/shares"), { method: "POST", body: { kind: "event", ref: e.id, label: e.name } });
+    const url = `${(location.origin)}${r.path}`;
+    try { await navigator.clipboard.writeText(url); toast("Share link copied. Anyone on your tailnet with it can view (only) this."); }
+    catch { toast(url, { ms: 12000 }); }
+  } catch (err) { toast(err.message, { kind: "error" }); }
+}
+
+/** The event's best photos, to save as an album (Albums › Best of). */
+export const bestOfHref = (p, e) => `#/p/${encodeURIComponent(p)}/albums?tab=bestof&event=${e.id}`;
 
 /** The Library's heading when it shows one event or trip: its name, dates and the same actions. */
 export function eventHeader(p, id, { onChange } = {}) {
@@ -149,6 +171,8 @@ export function eventHeader(p, id, { onChange } = {}) {
         h("button", { class: "btn small", type: "button", onclick: () => setPlace(e, again) }, "Set place…"),
         h("button", { class: "btn small", type: "button", title: "Keep or reject this event's RAWs (the JPEGs stay)", onclick: () => eventRaws(e, again) }, "RAWs…"),
         h("button", { class: "btn small", type: "button", onclick: () => hideEvent(e, !e.hidden, again) }, e.hidden ? "Show again" : "Hide"),
+        h("button", { class: "btn small", type: "button", title: "Copy a link that lets someone view (only) these photos", onclick: () => shareEvent(e) }, icon("share"), "Share"),
+        h("a", { class: "btn small", href: bestOfHref(p, e), title: "Its best photos, to save as an album" }, icon("star"), "Best of"),
         e.kind === "trip" ? h("a", { class: "btn small ghost", href: `#/p/${encodeURIComponent(p)}/events?open=${e.id}` }, "Trip page") : null));
     onChange?.("loaded");
   }
@@ -261,22 +285,13 @@ export function mount(root, ctx) {
           h("button", { class: "btn", onclick: () => setPlace(e, render) }, icon("pin"), "Set place…"),
           h("button", { class: "btn", title: "Keep or reject this trip's RAWs (the JPEGs stay)", onclick: () => eventRaws(e, render) }, "RAWs…"),
           h("button", { class: "btn", onclick: () => hideEvent(e, !e.hidden, render) }, e.hidden ? "Show again" : "Hide"),
-          h("button", { class: "btn", onclick: () => share(e) }, icon("share"), "Share"),
-          h("a", { class: "btn", href: `#/p/${encodeURIComponent(p)}/albums?tab=bestof&event=${e.id}` }, icon("star"), "Best of"),
+          h("button", { class: "btn", onclick: () => shareEvent(e) }, icon("share"), "Share"),
+          h("a", { class: "btn", href: bestOfHref(p, e) }, icon("star"), "Best of"),
           h("a", { class: "btn primary", href: e.kind === "trip" ? lib(`trip=${e.id}`) : lib(`event=${e.id}`) }, "Open in Library"))),
       h("section", { class: "section" }, h("h2", {}, "Best photos"),
         h("div", { class: "strip", style: { "--strip-h": "180px" } }, d.best.map((r, i) => thumbButton(r, () => openLoupe({ ids: d.best.map((x) => x.id), index: i }), { size: "m" })))),
       d.children.length ? h("section", { class: "section" }, h("h2", {}, `Days and moments · ${d.children.length}`),
         h("div", { class: "event-cards" }, d.children.map((c) => card({ ...c, kind: "event" })))) : null);
-  }
-
-  async function share(e) {
-    try {
-      const r = await api(P(p, "/shares"), { method: "POST", body: { kind: "event", ref: e.id, label: e.name } });
-      const url = `${(location.origin)}${r.path}`;
-      try { await navigator.clipboard.writeText(url); toast("Share link copied. Anyone on your tailnet with it can view (only) this."); }
-      catch { toast(url, { ms: 12000 }); }
-    } catch (err) { toast(err.message, { kind: "error" }); }
   }
 
   render();

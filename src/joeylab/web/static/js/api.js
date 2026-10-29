@@ -16,7 +16,7 @@ export async function api(path, { method = "GET", body, params } = {}) {
   try {
     res = await fetch(url, opts);
   } catch {
-    throw new ApiError("Can't reach JoeyLab. Is `joeylab serve` still running on your Mac?");
+    throw new ApiError("Can't reach JoeyLab. Is it still running on your Mac (joeylab serve, or the JoeyLab service)?");
   }
   const text = await res.text();
   let data = null;

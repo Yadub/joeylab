@@ -9,7 +9,7 @@ import { h } from "../ui.js";
 const STEPS = ["scan", "analyse", "group", "faces", "ai", "search", "places", "check"];
 const DOING = {
   scan: "looking for photos", analyse: "analysing photos", group: "stacking", faces: "finding faces",
-  ai: "comparing photos", search: "indexing for search", places: "finding places and events", check: "checking your folders",
+  ai: "comparing photos", search: "indexing for search and looking for pets", places: "finding places and events", check: "checking your folders",
 };
 
 /** Is the running update (job) past `step`, or is no update running? */

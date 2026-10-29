@@ -4,7 +4,7 @@ Each photo is indexed three ways, all locally:
   * SigLIP 2 embeddings of the whole frame plus 9 overlapping tiles, so small objects
     (a die on a table, a dog in the corner) are seen up close, and results can show where;
   * Apple Vision labels (1,300+ objects and scenes: dog, door, receipt, cake...);
-  * Apple Vision text recognition (signs, cake writing, documents).
+  * Apple Vision text recognition (signs, cake writing, documents), in every language it reads.
 A search combines "looks like" (SigLIP's calibrated match probability) with label and text hits.
 
 Everything is computed from the local 768 px thumbnails, so originals (and their drives)
@@ -88,13 +88,10 @@ def warm_up(delay: float = 15.0) -> None:
 
 
 def available() -> bool:
-    try:
-        import open_clip  # noqa: F401
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    """Whether the AI extra is installed, without importing it (as ai.available)."""
+    from importlib.util import find_spec
+
+    return all(find_spec(m) is not None for m in ("open_clip", "torch", "transformers"))
 
 
 def vision_available() -> bool:
@@ -197,6 +194,26 @@ def crops_of(img) -> list:
 
 # ---------------------------------------------------------------- Apple Vision
 
+_OCR_LANGUAGES: list[str] | None = None
+
+
+def _every_language(ocr) -> None:
+    """Read text in every language Apple Vision can (English first), telling which one a photo's text is
+    in, rather than English only. New text only: photos read before keep theirs (INDEX_VERSION is as it was)."""
+    global _OCR_LANGUAGES
+    if _OCR_LANGUAGES is None:
+        try:
+            got = ocr.supportedRecognitionLanguagesAndReturnError_(None)
+            langs = [str(x) for x in (got[0] if isinstance(got, tuple) else got) or []]
+        except Exception:
+            langs = []
+        _OCR_LANGUAGES = sorted(langs, key=lambda x: not x.lower().startswith("en"))
+    if _OCR_LANGUAGES:
+        ocr.setRecognitionLanguages_(_OCR_LANGUAGES)
+    if hasattr(ocr, "setAutomaticallyDetectsLanguage_"):           # macOS 13 and later
+        ocr.setAutomaticallyDetectsLanguage_(True)
+
+
 def vision_analyze(path: str) -> dict:
     import Vision
     from Foundation import NSURL
@@ -205,6 +222,7 @@ def vision_analyze(path: str) -> dict:
     cls = Vision.VNClassifyImageRequest.alloc().init()
     ocr = Vision.VNRecognizeTextRequest.alloc().init()
     ocr.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    _every_language(ocr)
     reqs = [cls, ocr]
     aes = None
     if hasattr(Vision, "VNCalculateImageAestheticsScoresRequest"):   # macOS 15+
@@ -501,10 +519,33 @@ def _open_store(conn, db_file: str, stamp: tuple):
     return ids, np.memmap(mat_path, dtype=np.float16, mode="r").reshape(k * N_CROPS, dim)
 
 
-def _dot(mat16: np.ndarray, v: np.ndarray, chunk: int = 32768) -> np.ndarray:
-    """mat16 @ v in float32 a chunk at a time, so the index can stay float16 in memory."""
+_POOL = None
+
+
+def _pool():
+    global _POOL
+    with _LOCK:
+        if _POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _POOL = ThreadPoolExecutor(min(8, os.cpu_count() or 1), thread_name_prefix="search-score")
+        return _POOL
+
+
+def _dot(mat16: np.ndarray, v: np.ndarray, chunk: int = 32768, rows: np.ndarray | None = None) -> np.ndarray:
+    """mat16 @ v (only these rows of it, with `rows`) in float32 a chunk at a time, so the index can stay
+    float16 in memory. The chunks go to several threads at once (each row's product is the same as
+    one at a time): a search of 75,000 photos took half a second on one."""
     v = v.astype(np.float32)
-    return np.concatenate([mat16[i : i + chunk].astype(np.float32) @ v for i in range(0, len(mat16), chunk)])
+    n = len(mat16) if rows is None else len(rows)
+
+    def part(i: int) -> np.ndarray:
+        block = mat16[i : i + chunk] if rows is None else mat16[rows[i : i + chunk]]
+        return block.astype(np.float32) @ v
+
+    if n <= chunk:
+        return part(0) if n else np.empty(0, dtype=np.float32)
+    return np.concatenate(list(_pool().map(part, range(0, n, chunk))))
 
 
 def indexed_count(conn) -> int:
@@ -554,8 +595,22 @@ def _stem(w: str) -> str:
     return w
 
 
-def _keyword_hits(conn, query: str) -> dict[int, dict]:
-    """Photos whose Vision labels or recognised text mention the query's words."""
+_LABEL_STEMS: dict[str, frozenset] = {}
+
+
+def _label_stems(label: str) -> frozenset:
+    """A Vision label's stemmed words (worked out once per label: there are about 1,300)."""
+    out = _LABEL_STEMS.get(label)
+    if out is None:
+        if len(_LABEL_STEMS) > 20000:
+            _LABEL_STEMS.clear()
+        out = _LABEL_STEMS[label] = frozenset(_stem(x) for x in _WORD.findall(label.lower()))
+    return out
+
+
+def _keyword_hits(conn, query: str, among: set[int] | None = None) -> dict[int, dict]:
+    """Photos whose Vision labels or recognised text mention the query's words (only those `among`
+    these ids, when given: a word like "people" names most photos' labels)."""
     words = [w for w in _WORD.findall(query.lower()) if len(w) > 2 and w not in {"the", "and", "with", "photo", "picture"}]
     if not words:
         return {}
@@ -570,10 +625,11 @@ def _keyword_hits(conn, query: str) -> dict[int, dict]:
         return {}
     phrase = query.lower().strip()
     for sid, labels, text in rows:
+        if among is not None and sid not in among:
+            continue
         best, which = 0.0, None
         for lbl, conf in json.loads(labels or "[]"):
-            lw = {_stem(x) for x in _WORD.findall(lbl.lower())}
-            if lw & stems and conf > best:
+            if conf > best and _label_stems(lbl) & stems:
                 best, which = conf, lbl
         text_hit = bool(text) and phrase in text.lower()
         if best or text_hit:
@@ -591,23 +647,37 @@ def concepts(query: str) -> list[str]:
     return parts if 2 <= len(parts) <= 4 else [query]
 
 
-def _concept_ok(conn, model, mat, n: int, text: str) -> np.ndarray:
+def _concept_ok(conn, model, mat, n: int, text: str, rows: np.ndarray | None = None) -> np.ndarray:
     """Which photos show this concept at least possibly (picture match or Apple label/text)."""
-    s = _dot(mat, model.embed_text(text)).reshape(n, N_CROPS).max(axis=1)
+    s = _dot(mat, model.embed_text(text), rows=rows).reshape(n, N_CROPS).max(axis=1)
     ok = model.probability(s) >= POSSIBLE_PROB
     return ok
+
+
+def _rows_of(ids: np.ndarray, hits) -> np.ndarray:
+    """Where these photo ids are in `ids` (photos not in it are left out)."""
+    return np.nonzero(np.isin(ids, np.fromiter(hits, dtype=ids.dtype, count=len(hits))))[0]
 
 
 def search(conn, query: str, limit: int = 120, restrict: set[int] | None = None) -> list[dict]:
     """Ranked results: {id, score, prob, box, label, text, all_parts}. With several parts ("dog on
     a beach"), photos showing every part rank first and only they can be "strong" matches.
-    `restrict` limits results to these photo ids (a filter applied before ranking)."""
+    `restrict` limits the search to these photo ids (a filter): only their vectors are scored, and a
+    "strong" match is judged against the best match among them."""
     m = _matrix(conn)
     if m is None:
         return []
     ids, mat = m
+    rows = None
+    if restrict is not None:
+        restrict = restrict if isinstance(restrict, (set, frozenset)) else set(restrict)
+        among = _rows_of(ids, restrict)
+        if not len(among):
+            return []
+        ids = ids[among]
+        rows = (among[:, None] * N_CROPS + np.arange(N_CROPS)).ravel()
     model = Model.get()
-    sims = _dot(mat, model.embed_text(query)).reshape(len(ids), N_CROPS)
+    sims = _dot(mat, model.embed_text(query), rows=rows).reshape(len(ids), N_CROPS)
     best_crop = sims.argmax(axis=1)
     best = sims.max(axis=1)
     prob = model.probability(best)
@@ -620,25 +690,21 @@ def search(conn, query: str, limit: int = 120, restrict: set[int] | None = None)
     qstems = {_stem(w) for w in _WORD.findall(query.lower())}
     checkable = bool(qstems & vocab)
     has_vision = _vision_ids(conn) if checkable else set()
-    kw = _keyword_hits(conn, query)
+    kw = _keyword_hits(conn, query, restrict)
     score = prob.copy()
-    for k, sid in enumerate(ids):
-        h = kw.get(int(sid))
-        if h:
-            score[k] += 0.5 * h["label_conf"] + (0.3 if h["text"] else 0)
+    for k in _rows_of(ids, kw) if kw else ():               # (the few photos a label or text names)
+        h = kw[int(ids[k])]
+        score[k] += 0.5 * h["label_conf"] + (0.3 if h["text"] else 0)
     parts = concepts(query)
     all_parts = np.ones(len(ids), dtype=bool)
     if len(parts) > 1:
         for part in parts:
-            ok = _concept_ok(conn, model, mat, len(ids), part)
-            hits = _keyword_hits(conn, part)
+            ok = _concept_ok(conn, model, mat, len(ids), part, rows)
+            hits = _keyword_hits(conn, part, restrict)
             if hits:
-                ok |= np.array([int(s) in hits for s in ids])
+                ok[_rows_of(ids, hits)] = True
             all_parts &= ok
         score = score + all_parts.astype(np.float32)        # every part shown: ahead of partial matches
-    if restrict is not None:
-        mask = np.isin(ids, np.fromiter(restrict, dtype=ids.dtype, count=len(restrict)) if restrict else np.array([], dtype=ids.dtype))
-        score = np.where(mask, score, -np.inf)
     boxes = crop_boxes()
     order = [k for k in np.argsort(-score)[:limit] if np.isfinite(score[k])]
     out = []

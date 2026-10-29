@@ -596,9 +596,18 @@ def merge(conn, keep_id: int, other_id: int) -> dict:
         "SELECT MIN(s.id) FROM shots s LEFT JOIN events e ON e.id = s.event_id WHERE s.status='present'"
         " AND (s.event_id = ? OR e.parent_id = ?)", (eid, eid)).fetchone()[0]
     mine = anchor(keep_id)
-    pairs = [{"kind": kind, "a": mine, "b": anchor(g)} for g in gone]
-    db.set_setting(conn, JOINS_KEY, (db.get_setting(conn, JOINS_KEY, []) or []) + [p for p in pairs if p["a"] and p["b"]])
+    pairs = [p for p in ({"kind": kind, "a": mine, "b": anchor(g)} for g in gone) if p["a"] and p["b"]]
     q = ",".join("?" * len(gone))
+    # What Undo needs: the pairs added, and the events as they were (their names, and which photos or
+    # events were theirs), so unmerging gives each its own id and name back.
+    undo = {"kind": kind, "keep": keep_id, "joins": pairs,
+            "events": [dict(r) for r in conn.execute(f"SELECT * FROM events WHERE id IN ({q})", gone)]}
+    if kind == "event":
+        undo["photos"] = {str(g): [r[0] for r in conn.execute("SELECT id FROM shots WHERE event_id=?", (g,))] for g in gone}
+    else:
+        ins = ",".join("?" * len(events_in))
+        undo["parents"] = {str(r[0]): r[1] for r in conn.execute(f"SELECT id, parent_id FROM events WHERE id IN ({ins})", events_in)}
+    db.set_setting(conn, JOINS_KEY, (db.get_setting(conn, JOINS_KEY, []) or []) + pairs)
     if kind == "event":
         conn.execute(f"UPDATE shots SET event_id=? WHERE event_id IN ({q})", (keep_id, *gone))
     else:
@@ -608,7 +617,51 @@ def merge(conn, keep_id: int, other_id: int) -> dict:
     if a["parent_id"]:
         _refresh(conn, a["parent_id"])
     conn.commit()
-    return {"id": keep_id, "merged": len(gone)}
+    return {"id": keep_id, "merged": len(gone), "undo": undo}
+
+
+def unmerge(conn, undo: dict) -> dict:
+    """Undo a merge, from what merge() returned: the pairs it added are taken out (so updates find the
+    events apart again), and the events it joined come back with their ids, names and photos. Call
+    run() afterwards to find events and trips again for what changed since."""
+    try:
+        kind = "trip" if undo.get("kind") == "trip" else "event"
+        keep = int(undo["keep"])
+        pairs = [(int(p["a"]), int(p["b"])) for p in undo.get("joins") or []]
+        old = [dict(e) for e in undo.get("events") or [] if isinstance(e, dict) and int(e.get("id") or 0)]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("That merge can't be undone from here.") from None
+    db.write_lock(conn)
+    left = list(pairs)
+    kept = []
+    for j in db.get_setting(conn, JOINS_KEY, []) or []:
+        pair = (j.get("a"), j.get("b")) if isinstance(j, dict) and j.get("kind") == kind else None
+        if pair in left:
+            left.remove(pair)                 # one of this merge's pairs: taken out (once each)
+        else:
+            kept.append(j)
+    conn.execute("INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (JOINS_KEY, json.dumps(kept)))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    for e in old:
+        row = {k: v for k, v in e.items() if k in cols}
+        conn.execute(f"INSERT OR IGNORE INTO events({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values()))
+    back = [e["id"] for e in old]
+    if kind == "event":
+        for eid, ids in (undo.get("photos") or {}).items():
+            ids = [int(i) for i in ids]
+            for k in range(0, len(ids), 900):
+                chunk = ids[k : k + 900]
+                conn.execute(f"UPDATE shots SET event_id=? WHERE event_id=? AND id IN ({','.join('?' * len(chunk))})",
+                             (int(eid), keep, *chunk))
+    else:
+        for eid, parent in (undo.get("parents") or {}).items():
+            conn.execute("UPDATE events SET parent_id=? WHERE id=? AND parent_id=?", (parent, int(eid), keep))
+    for eid in [keep, *back]:
+        if conn.execute("SELECT 1 FROM events WHERE id=?", (eid,)).fetchone():
+            _refresh(conn, eid)
+    conn.commit()
+    return {"id": keep, "restored": len(back)}
 
 
 def _refresh(conn, event_id: int) -> None:
@@ -627,6 +680,7 @@ def _refresh(conn, event_id: int) -> None:
             _name_by_kind(conn, [g])
         except Exception:      # naming by look is a nicety
             pass
+    else:
         label = _trip_label(conn, g["place_counts"]) if g["place_counts"] else (g["where"] or {}).get("name")
         g["auto_name"] = f"{label} trip · {g['when']}" if label else f"Trip · {g['when']}"
     conn.execute("UPDATE events SET name=?, auto_name=?, start_ts=?, end_ts=?, n=?, cover_shot_id=?, places=?, place=?, alt_name=?, folder=?"

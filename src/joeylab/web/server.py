@@ -195,10 +195,14 @@ class Background:
             self._go(f"rescore:{project}", project, scoring.run)
 
     def recluster(self, project: str) -> None:
-        from .. import faces
+        """Group faces and pets again after you named or unnamed some."""
+        from .. import faces, pets
 
+        def fn(conn):
+            faces.cluster(conn)
+            pets.cluster(conn)
         if project not in self.jobs.running:
-            self._go(f"recluster:{project}", project, faces.cluster)
+            self._go(f"recluster:{project}", project, fn)
 
     QUIET_S = 20.0           # retrain once decisions pause this long...
     MIN_GAP_S = 120.0        # ...and no more often than this

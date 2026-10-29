@@ -102,8 +102,14 @@ export function mount(root, ctx) {
   const strip = h("div", { class: "cull-strip", role: "listbox", "aria-label": "Frames in this stack" });
   const zc = zoomControl((v) => setZoom(v));
   const barMain = h("div", { class: "bar-main" });
+  // A phone or tablet: a second row for the stars, Accept and the rest, so Pick, Reject, Undo and Next
+  // stay in reach on the first.
+  const barMore = h("div", { class: "bar-more", hidden: true });
+  const narrowBar = window.matchMedia("(max-width: 900px)");
   const nextBtn = h("button", { class: "btn primary next", title: "Next stack (↓)", onclick: () => goStack(st.si + 1) }, "Next", icon("down"));
-  const bar = h("div", { class: "cull-bar" }, barMain, nextBtn);
+  const bar = h("div", { class: "cull-bar" }, barMain, nextBtn, barMore);
+  const onNarrow = () => { if (stack()) render(); };
+  narrowBar.addEventListener("change", onNarrow);
   const swipeHint = h("div", { class: "swipe-hint" }, "Swipe up to pick, down to reject, sideways between frames · tap to open");
   const shell = h("div", { class: "cull stage-ui" }, head, h("div", { class: "cull-main" }, stage, facesPanel), strip, bar, swipeHint);
   root.append(shell);
@@ -264,8 +270,13 @@ export function mount(root, ctx) {
     const cur = row(focusId());
     where.textContent = `Stack ${n(s.no ?? st.si + 1)}`;
     const left = st.stacks.reduce((a, x) => a + undecidedIn(x), 0);
+    const stacksLeft = st.stacks.filter((x) => undecidedIn(x) > 0).length;
     const here = s.ids.length - undecidedIn(s);
-    clear(stats).append(h("span", { class: "sep" }, " · "), `${n(left)} undecided left`,
+    // Going through picks, rejects or rated photos, nothing is undecided: say where you are instead.
+    // Otherwise the photos left, and the stacks they're in (what the top bar's Cull counts).
+    const progressText = ["picks", "rejects", "rated"].includes(status) ? `${n(st.si + 1)} of ${plural(st.stacks.length, "stack")}`
+      : stacksLeft && stacksLeft !== left ? `${n(left)} undecided left in ${plural(stacksLeft, "stack")}` : `${n(left)} undecided left`;
+    clear(stats).append(h("span", { class: "sep" }, " · "), progressText,
       s.ids.length > 1 ? ` · ${n(here)}/${n(s.ids.length)} decided here` : "");
     const bursts = (s.breaks?.length || 0) + 1;
     kind.textContent = [s.ids.length > 1 ? `${n(s.ids.length)} frames` : "Single photo",
@@ -410,24 +421,30 @@ export function mount(root, ctx) {
 
   function paintBar(cur, s) {
     const decided = !undecided(cur);
-    clear(barMain).append(
-      starsEl(cur.rating || 0, (v) => decideFocus({ rating: v })),
-      h("button", { class: `btn pick-btn ${cur.pick === 1 ? "on-pick" : ""}`, title: "Pick (P)", onclick: () => pickReject(1) }, icon("pick"), "Pick", h("kbd", {}, "P")),
-      h("button", { class: `btn reject-btn ${cur.pick === -1 ? "on-reject" : ""}`, title: "Reject (X)", onclick: () => pickReject(-1) }, icon("reject"), "Reject", h("kbd", {}, "X")),
-      decided ? h("button", { class: "btn ghost clear-btn", title: "Clear the pick or reject and the stars (0)", onclick: clearFocus }, "Clear", h("kbd", {}, "0")) : null,
-      s.ids.length > 1 ? h("button", { class: "btn keep-btn", title: "Pick this frame and reject the others (⇧P)", onclick: keepOnly },
-        icon("keep"), "Keep only this", h("kbd", {}, "⇧P")) : null,
-      h("button", { class: "btn ghost accept-btn", title: s.ids.length > 1 ? "Accept: keep the best frame, reject the rest (A)" : "Accept the suggestion (A)", onclick: acceptStack },
-        icon("sparkle"), h("span", {}, "Accept"), h("kbd", {}, "A")),
-      h("button", { class: `btn ghost icon-only ${cur.fav ? "on-fav" : ""}`, title: "Favourite (F)", "aria-label": "Favourite", onclick: () => toggleFav([cur.id], !cur.fav) }, icon(cur.fav ? "heartOn" : "heart")),
-      h("span", { class: "spacer" }),
-      h("button", { class: "btn ghost icon-only", title: "Undo (U)", "aria-label": "Undo", onclick: () => undo() }, icon("undo")),
-      zc.el);
+    const stars = starsEl(cur.rating || 0, (v) => decideFocus({ rating: v }));
+    const pick = h("button", { class: `btn pick-btn ${cur.pick === 1 ? "on-pick" : ""}`, title: "Pick (P)", onclick: () => pickReject(1) }, icon("pick"), "Pick", h("kbd", {}, "P"));
+    const reject = h("button", { class: `btn reject-btn ${cur.pick === -1 ? "on-reject" : ""}`, title: "Reject (X)", onclick: () => pickReject(-1) }, icon("reject"), "Reject", h("kbd", {}, "X"));
+    const clearBtn = decided ? h("button", { class: "btn ghost clear-btn", title: "Clear the pick or reject and the stars (0)", onclick: clearFocus }, "Clear", h("kbd", {}, "0")) : null;
+    const keep = s.ids.length > 1 ? h("button", { class: "btn keep-btn", title: "Pick this frame and reject the others (⇧P)", onclick: keepOnly },
+      icon("keep"), "Keep only this", h("kbd", {}, "⇧P")) : null;
+    const accept = h("button", { class: "btn ghost accept-btn", title: s.ids.length > 1 ? "Accept: keep the best frame, reject the rest (A)" : "Accept the suggestion (A)", onclick: acceptStack },
+      icon("sparkle"), h("span", {}, "Accept"), h("kbd", {}, "A"));
+    const fav = h("button", { class: `btn ghost icon-only ${cur.fav ? "on-fav" : ""}`, title: "Favourite (F)", "aria-label": "Favourite", onclick: () => toggleFav([cur.id], !cur.fav) }, icon(cur.fav ? "heartOn" : "heart"));
+    const undoBtn = h("button", { class: "btn ghost icon-only undo-btn", title: "Undo (U)", "aria-label": "Undo", onclick: () => undo() }, icon("undo"));
+    if (narrowBar.matches) {
+      clear(barMain).append(pick, reject, h("span", { class: "spacer" }), undoBtn);
+      clear(barMore).append(accept, stars, fav, clearBtn, keep, zc.el);
+      barMore.hidden = false;
+    } else {
+      clear(barMain).append(stars, pick, reject, clearBtn, keep, accept, fav, h("span", { class: "spacer" }), undoBtn, zc.el);
+      clear(barMore);
+      barMore.hidden = true;
+    }
     zc.paint(st.lock.level);
   }
 
   function renderDone() {
-    clear(strip); strip.hidden = true; clear(barMain);
+    clear(strip); strip.hidden = true; clear(barMain); clear(barMore); barMore.hidden = true;
     facesPanel.hidden = true;
     kind.textContent = stats.textContent = "";
     viewerEl.hidden = surveyEl.hidden = true;
@@ -487,11 +504,12 @@ export function mount(root, ctx) {
   function toggleFaces() {
     st.faces = !st.faces;
     facesPanel.hidden = !st.faces;
-    if (st.faces) paintFaces(); else render();
+    if (st.faces) paintFaces(true); else render();
     facesBtn.setAttribute("aria-pressed", st.faces ? "true" : "false");
   }
 
-  async function paintFaces() {
+  /** `asked`: G or Faces was just pressed (so a stack without faces says so). */
+  async function paintFaces(asked = false) {
     const s = stack();
     if (!s || s.ids.length < 2) { facesPanel.hidden = true; return; }
     facesPanel.hidden = false;
@@ -500,17 +518,31 @@ export function mount(root, ctx) {
     try { d = await api(P(ctx.project, "/compare-faces"), { params: { ids: s.ids.join(",") } }); }
     catch (e) { clear(facesPanel).append(h("div", { class: "muted" }, e.message)); return; }
     if (stack() !== s) return;
-    if (!d.people.length) { clear(facesPanel).append(h("div", { class: "muted" }, "No faces large enough to compare in this burst.")); return; }
+    // No faces here: the panel stays out of the way (it would take half the stage on every stack).
+    if (!d.people.length) {
+      facesPanel.hidden = true;
+      if (!store.overview?.counts?.faces) {             // none in the whole library: recognition is off, or found nothing
+        st.faces = false;
+        facesBtn.setAttribute("aria-pressed", "false");
+        toast("This library has no faces to compare. Face recognition can be turned on in Settings › People & privacy.",
+          { action: () => ctx.go("settings", { s: "privacy" }), actionLabel: "Settings", key: "faces" });
+      } else if (asked) note("No faces large enough to compare in this stack");
+      return;
+    }
     const frameIds = d.frames;
+    // Most eyes open first; between frames level on that, the faces that look best (face quality, smiles
+    // and focus: a turned head alone never decides).
     const bestFrame = frameIds.reduce((b, id) => {
       const sc = d.score[String(id)];
       const sb = d.score[String(b)];
-      return (sc.closed + sc.missing) < (sb.closed + sb.missing) ? id : b;
+      const ka = sc.closed + sc.missing, kb = sb.closed + sb.missing;
+      return ka < kb || (ka === kb && (sc.look ?? 0) > (sb.look ?? 0) + 0.02) ? id : b;
     }, frameIds[0]);
     clear(facesPanel).append(
       h("div", { class: "faces-head" }, h("b", {}, "Faces across the burst"),
         h("span", { class: "muted" }, "Pick the frame where everyone looks right. Red: eyes closed."),
-        h("button", { class: "btn small", onclick: () => goFrame(s.ids.indexOf(bestFrame)) }, "Go to the frame with most eyes open")),
+        h("button", { class: "btn small", title: "Most eyes open; between those, the best face quality, smiles and focus",
+          onclick: () => goFrame(s.ids.indexOf(bestFrame)) }, "Go to the best frame for faces")),
       h("div", { class: "faces-grid", style: { "--cols": frameIds.length } },
         h("div", { class: "fh" }),
         frameIds.map((id, i) => h("button", { type: "button", class: `fh frame-col ${s.ids[st.fi] === id ? "cur" : ""}`, onclick: () => goFrame(s.ids.indexOf(id)) },
@@ -520,7 +552,8 @@ export function mount(root, ctx) {
           ...frameIds.map((id) => {
             const f = person.faces[String(id)];
             return f ? h("div", { class: `fcell ${f.closed ? "closed" : ""} ${s.ids[st.fi] === id ? "cur" : ""}`, onclick: () => goFrame(s.ids.indexOf(id)),
-              title: `${f.closed ? "Eyes closed" : "Eyes open"}${f.smile !== null ? ` · smile ${Math.round(f.smile * 100)}%` : ""} · focus ${Math.round(f.sharp)}` },
+              title: `${f.closed ? "Eyes closed" : "Eyes open"}${f.smile !== null ? ` · smile ${Math.round(f.smile * 100)}%` : ""} · focus ${Math.round(f.sharp)}`
+                + (f.caught !== null && f.caught !== undefined ? ` · face quality ${Math.round(f.caught * 100)}%` : "") },
             h("img", { src: `/img/${encodeURIComponent(ctx.project)}/f/${f.id}`, alt: "" })) : h("div", { class: "fcell none" }, "—");
           }),
         ])));
@@ -785,6 +818,6 @@ export function mount(root, ctx) {
     keys: KEYS,
     refresh: load,
     waiting: () => !!st.waiting,
-    unmount() { off(); offJob(); headSize.disconnect(); dropCells(); pc.destroy(); if (store.show === goToPhoto) store.show = null; },
+    unmount() { off(); offJob(); headSize.disconnect(); narrowBar.removeEventListener("change", onNarrow); dropCells(); pc.destroy(); if (store.show === goToPhoto) store.show = null; },
   };
 }

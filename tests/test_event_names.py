@@ -51,3 +51,52 @@ def test_every_event_gets_what_its_photos_show_as_its_other_name(env, monkeypatc
 
     assert query.parse("event:dance", conn)["filter"].get("event") in {r[0] for r in conn.execute("SELECT id FROM events")}
     assert query.parse("event:SD Card", conn)["filter"].get("event")
+
+
+def test_an_indian_weddings_occasions_are_named_or_called_a_wedding():
+    """Haldi, mehendi, sangeet and the rest are kinds of their own; an event split between them is a Wedding
+    when together they have most of its photos, and festivals are named too."""
+    import numpy as np
+
+    from joeylab import explore, scenes
+
+    names = [k for k, _ in scenes.KINDS]
+    for word in ("Haldi", "Mehendi", "Sangeet", "Baraat", "Varmala", "Pheras", "Vidaai", "Wedding reception",
+                 "Sadya", "Pookalam", "Diwali"):
+        assert word in names and word in explore.VOCAB and word in explore.DESCRIBED
+    # One description per kind and per nothing-in-particular phrase, each on an axis of its own.
+    n_desc = sum(len(p) for _, p in scenes.KINDS) + len(scenes.NOTHING_IN_PARTICULAR)
+    M = np.eye(n_desc, dtype=np.float32)
+    owner = np.array([i for i, (_, p) in enumerate(scenes.KINDS) for _ in p]
+                     + [len(scenes.KINDS) + j for j in range(len(scenes.NOTHING_IN_PARTICULAR))])
+    first = {name: int(np.flatnonzero(owner == i)[0]) for i, name in enumerate(names)}
+
+    def event(*parts):
+        X = [np.full(n_desc, 0.01, dtype=np.float32) for kind, n in parts for _ in range(n)]
+        for row, kind in zip(X, [kind for kind, n in parts for _ in range(n)]):
+            row[first[kind]] = 1.0
+        return X
+
+    plan = [event(("Haldi", 4), ("Sangeet", 4), ("Beach", 3)),       # no one occasion has 40%, the wedding most: a Wedding
+            event(("Haldi", 9), ("Beach", 3)),                         # a haldi
+            event(("Climbing", 10)),
+            event(("Haldi", 2), ("Sangeet", 2), ("Beach", 3), ("Climbing", 3))]   # occasions, but not most of it: nothing
+    rows, events = [], []
+    for X in plan:
+        events.append(list(range(len(rows), len(rows) + len(X))))
+        rows += X
+    got = scenes.kinds_of(np.arange(len(rows)), np.stack(rows).astype(np.float16), events, (M, owner))
+    assert got == ["Wedding", "Haldi", "Climbing", None]
+
+
+def test_described_words_must_fit_a_region_better_than_plain_ones():
+    import numpy as np
+
+    from joeylab import explore
+
+    words = ["Sarees", "Vidaai"]
+    W = np.eye(2, dtype=np.float32)
+    level = np.array([[0.70, 0.70], [0.10, 0.10]], dtype=np.float32)     # as close to either: the plain word
+    clear = np.array([[0.30, 0.90], [0.20, 0.10]], dtype=np.float32)     # clearly the occasion: it's named
+    assert explore.name_clusters(level, W, words)[0].startswith("Sarees")
+    assert explore.name_clusters(clear, W, words)[0].startswith("Vidaai")

@@ -35,8 +35,25 @@ class Job:
         return {k: getattr(self, k) for k in (
             "id", "project", "kind", "state", "stage", "step", "ready", "done", "total", "started", "finished",
             "error")} | {
-            "log": self.log[-60:], "changed": bool(self.summary and not self.summary.get("skipped")),
+            "log": self.log[-60:], "changed": changed(self.summary), "files": files_of(self.summary),
             "untouched": (self.summary or {}).get("untouched")}
+
+
+def files_of(summary: dict | None) -> dict:
+    """What an update found on disk: files new (or back again), changed, and gone."""
+    scan = (summary or {}).get("scan") or {}
+    return {"added": (scan.get("added") or 0) + (scan.get("returned") or 0), "changed": scan.get("changed") or 0,
+            "gone": scan.get("missing") or 0}
+
+
+def changed(summary: dict | None) -> bool:
+    """Whether an update changed anything a page shows: files new, changed or gone, or photos read
+    (analysed, faces found, indexed for search). One that found nothing to do changed nothing."""
+    if not summary or summary.get("skipped"):
+        return False
+    scan = summary.get("scan") or {}
+    return bool(any(files_of(summary).values()) or scan.get("moved") or scan.get("roots_moved")
+                or any(isinstance(summary.get(k), int) and summary[k] > 0 for k in ("analysed", "faces", "embedded", "search_indexed")))
 
 
 class JobReporter(pipeline.Reporter):
@@ -116,8 +133,16 @@ class JobManager:
 
     def _run(self, job: Job, paths: list[str], force: bool, only_if_changed: bool, quick: bool = False) -> None:
         rep = JobReporter(job, self.lock, self.after_analysis, on_grouped=self._bump)
+        removed = False
         try:
-            conn = db.connect(job.project)
+            try:
+                conn = db.connect(job.project, create=False)
+            except FileNotFoundError:
+                # The library was removed after this update was asked for (by the folder watcher, say):
+                # nothing to update, and it mustn't be made again.
+                removed = True
+                job.state, job.stage = "done", "Library removed"
+                return
             if paths:
                 pipeline.add_roots(conn, [Path(p) for p in paths], rep, job.project)
             if not conn.execute("SELECT 1 FROM roots").fetchone():
@@ -144,9 +169,17 @@ class JobManager:
             job.finished = time.time()
             with self.lock:
                 self.running.pop(job.project, None)
-                if job.kind != "watch" or job.state == "error" or (job.summary and not job.summary.get("skipped")):
+                if removed:
+                    self.last.pop(job.project, None)
+                    self.versions.pop(job.project, None)
+                    watcher = getattr(self, "watcher", None)
+                    if watcher:
+                        with watcher.lock:
+                            watcher.dirty.pop(job.project, None)
+                elif job.kind != "watch" or job.state == "error" or (job.summary and not job.summary.get("skipped")):
                     self.last[job.project] = job
-                if job.summary and not job.summary.get("skipped"):
+                # Open pages hear of an update only when it changed something they show.
+                if changed(job.summary):
                     self.versions[job.project] = self.versions.get(job.project, 0) + 1
                     self._copies_wake.set()          # new files may be backups: check them once the updates are done
 

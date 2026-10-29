@@ -161,8 +161,11 @@ export async function trashDialog({ what, filter = {}, ids, set_ids, title, intr
       clear(body).append(
         h("div", { class: "result" }, h("b", {}, what === "folders" ? `Moved ${plural(res.moved, "folder")} to the Trash.`
           : `Moved ${plural(res.moved, "file")} (${bytes(res.bytes)}) to the Trash.`)),
-        h("p", { class: "note" }, "To get the space back, empty the Trash in Finder. Until then, Put Back in Finder returns anything, and JoeyLab finds it again on its next update."),
-        res.emptied ? h("p", {}, `${plural(res.emptied, "folder")} left empty: see Tidy › Library health › Empty folders.`) : null,
+        h("p", { class: "note" }, "To get the space back, empty the Trash in Finder. Until then, Put Back returns anything: ",
+          h("a", { href: `#/p/${encodeURIComponent(p)}/history?tab=trash` }, "History › Moved to the Trash"),
+          " puts it back where it was, and so does Finder's Put Back (JoeyLab finds it again on its next update)."),
+        res.emptied ? h("p", {}, `${plural(res.emptied, "folder")} left empty: see `,
+          h("a", { href: `#/p/${encodeURIComponent(p)}/tidy?tab=health&empty=1` }, "Tidy › Health › Empty folders"), ".") : null,
         res.left.length ? h("details", {}, h("summary", { class: "label" }, `${plural(res.left.length, "item")} left alone`),
           res.left.map((x) => h("div", { class: "path" }, `${x.path}: ${x.why}`))) : null,
         h("div", { class: "muted small mono" }, `Log: ${res.log}`));

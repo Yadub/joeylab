@@ -62,6 +62,23 @@ def matrix(conn) -> tuple[np.ndarray, np.ndarray, str] | None:
     return out
 
 
+def has_vectors(conn) -> bool:
+    """Whether matrix() has anything to give, without reading a vector: a present photo with a current
+    search vector, or with a current CLIP vector."""
+    if _table(conn, "search_vecs"):
+        from .search import _VALID, INDEX_VERSION
+
+        if conn.execute(_VALID.format(cols="1") + " LIMIT 1", (INDEX_VERSION,)).fetchone():
+            return True
+    if _table(conn, "embeddings"):
+        from .ai import MODEL_TAG
+
+        return bool(conn.execute(
+            "SELECT 1 FROM embeddings e JOIN shots s ON s.id = e.shot_id"
+            " WHERE s.status='present' AND e.model = ? AND e.src = s.analyzed_fp LIMIT 1", (MODEL_TAG,)).fetchone())
+    return False
+
+
 class Frames(Mapping):
     """{photo id: whole-frame vector}, read from the float16 matrix one photo at a time as asked
     (a float32 copy of every vector would be gigabytes in a big library)."""
@@ -102,4 +119,4 @@ def text_vector(conn, text: str) -> np.ndarray | None:
         return Model.get().embed_text(text)
     from .ai import Models
 
-    return Models.get().embed_text(text)
+    return Models.get(text_only=True).embed_text(text)

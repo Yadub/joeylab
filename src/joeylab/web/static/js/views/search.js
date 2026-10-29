@@ -130,11 +130,12 @@ export function mount(root, ctx) {
         parts ? h("span", { class: "pill neutral", title: "Each photo has to show all of these" }, `shows ${parts.map((x) => x.replace(/^(a|an|the)\s+/i, "")).join(" + ")}`)
           : res.text ? h("span", { class: "pill neutral" }, `looks like “${res.text}”`) : null);
     }
-    // The filters understood open in the Library (the picture part stays here).
-    const flt = res.filter || {};
-    openLib.hidden = !Object.keys(flt).length;
-    openLib.href = `#/p/${encodeURIComponent(ctx.project)}/library?${new URLSearchParams(flt).toString()}`;
-    openLib.title = res.text ? `The Library shows these filters; it can't look for “${res.text}” in the pictures` : "Show these photos in the Library";
+    // The whole search opens in the Library as what it shows: the filters understood, and the picture part
+    // as a search there (its strong and possible matches, every frame), with the Library's summary, filters and Explore.
+    const libParams = { ...(res.filter || {}), ...(res.text && res.engine === "siglip2" ? { q: res.text } : {}) };
+    openLib.hidden = Boolean(similar || concept) || !Object.keys(libParams).length;
+    openLib.href = `#/p/${encodeURIComponent(ctx.project)}/library?${new URLSearchParams(libParams).toString()}`;
+    openLib.title = "Show these photos in the Library: its filters, months, Explore and a summary of when, who and where";
     burstBox.hidden = !res.engine || res.engine === "filter";
     hiddenChip.hidden = !res.hidden;
     hiddenChip.textContent = `${n(res.hidden || 0)} hidden`;
@@ -144,6 +145,14 @@ export function mount(root, ctx) {
       ? ` Search covers ${res.indexed.toLocaleString()} of ${plural(res.photos, "photo")} so far; indexing continues.` : "";
     const total = res.total ?? res.rows?.length ?? 0;
     page.querySelector(".search-tools")?.classList.toggle("none", !total);    // nothing to select or save
+    // The picture match sees no photo yet: say so, and offer what was understood on its own.
+    if (!similar && !concept && res.text && res.indexed === 0 && res.photos) {
+      const asked = Object.keys(res.filter || {}).length;
+      clear(status).append(`Picture search covers 0 of ${plural(res.photos, "photo")} so far, so nothing can match “${res.text}” yet. `,
+        asked ? h("a", { class: "linkish", href: `#/p/${encodeURIComponent(ctx.project)}/library?${new URLSearchParams(res.filter).toString()}` },
+          `Show the photos matching ${(res.chips || []).join(", ") || "the rest"} instead`) : null);
+      return;
+    }
     if (similar) status.textContent = `${plural(total, "photo")} that look most like this one.`;
     else if (concept) status.textContent = `${plural(total, "photo")} like your examples of “${res.name}”, best first.`;
     else if (res.engine === "filter") status.textContent = `${plural(total, "photo")} match${sort === "best" ? ", best first" : ""}.`;

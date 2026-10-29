@@ -176,7 +176,13 @@ def active() -> str:
 
 
 def limits(key: str | None = None) -> dict:
-    return MODELS[key or active()].limits
+    """Similarity bars for a set of face models' vectors, or for pets' (pets.MODEL)."""
+    key = key or active()
+    if key not in MODELS:
+        from . import pets
+
+        return pets.LIMITS
+    return MODELS[key].limits
 
 
 def enabled() -> bool:
@@ -482,12 +488,9 @@ def pending(conn, force: bool = False) -> list[dict]:
     return out
 
 
-def _carry(old: list, new: list[dict], key: str) -> list[tuple]:
-    """What each face found again in a photo keeps from the face in the same place before (centres
-    within half a face of each other; each earlier face goes to its nearest): a person you named,
-    or said it isn't, always. Faces found before with other models (a switch) also hand on their
-    group and the person the grouping gave them, so groups keep their ids, and named people their
-    photos, until the new models' grouping. Returns (cluster, person_id, person_src) per new face."""
+def same_place(old: list, new: list[dict]) -> list[int | None]:
+    """For each face found again in a photo, the earlier face in the same place (its index in `old`), if
+    any: centres within half a face of each other, each earlier face going to its nearest."""
     pairs = []
     for i, f in enumerate(new):
         cx, cy = f["x"] + f["w"] / 2, f["y"] + f["h"] / 2
@@ -497,13 +500,25 @@ def _carry(old: list, new: list[dict], key: str) -> list[tuple]:
             dy = abs(o["y"] + oh / 2 - cy) / (max(oh, f["h"]) or 1)
             if dx < 0.5 and dy < 0.5:
                 pairs.append((dx + dy, i, j))
-    out: list[tuple] = [(None, None, None)] * len(new)
-    taken_new, taken_old = set(), set()
+    out: list[int | None] = [None] * len(new)
+    taken_old = set()
     for _, i, j in sorted(pairs):
-        if i in taken_new or j in taken_old:
+        if out[i] is not None or j in taken_old:
             continue
-        taken_new.add(i)
+        out[i] = j
         taken_old.add(j)
+    return out
+
+
+def _carry(old: list, new: list[dict], key: str) -> list[tuple]:
+    """What each face found again in a photo keeps from the face in the same place before (same_place):
+    a person you named, or said it isn't, always. Faces found before with other models (a switch) also
+    hand on their group and the person the grouping gave them, so groups keep their ids, and named people
+    their photos, until the new models' grouping. Returns (cluster, person_id, person_src) per new face."""
+    out: list[tuple] = [(None, None, None)] * len(new)
+    for i, j in enumerate(same_place(old, new)):
+        if j is None:
+            continue
         o = old[j]
         switched = o["model"] != key
         if o["person_src"] == "user":
@@ -528,8 +543,146 @@ def _update_metrics(conn, shot_id: int, faces: list[dict]) -> None:
     else:
         face_sharp = smile = area = None
     conn.execute(
-        "UPDATE metrics SET faces=?, main_faces=?, eyes_closed=?, face_sharp=?, face_area=?, smile=? WHERE shot_id=?",
-        (len(faces), len(main), sum(f["closed"] for f in judged), face_sharp, area, smile, shot_id))
+        "UPDATE metrics SET faces=?, main_faces=?, eyes_closed=?, face_sharp=?, face_area=?, smile=?, face_quality=?"
+        " WHERE shot_id=?", (len(faces), len(main), sum(f["closed"] for f in judged), face_sharp, area, smile,
+                             _photo_quality(main), shot_id))
+
+
+def _photo_quality(main: list[dict]) -> float | None:
+    """The main faces' capture quality, the bigger faces counting for more; None until they're judged."""
+    judged = [(f["quality"], f["area"]) for f in main if f.get("quality") is not None and f["quality"] >= 0]
+    return float(np.average([q for q, _ in judged], weights=[a for _, a in judged])) if judged else None
+
+
+def refresh_metrics(conn, shot_ids) -> None:
+    """The face fields in these photos' metrics again, from their faces in the catalog: after faces were
+    found to be an animal's, or put back among people's (pets.py). The caller commits."""
+    for sid in set(shot_ids):
+        rows = conn.execute("SELECT area, closed, smile, sharp, quality FROM faces WHERE shot_id=? AND model=?"
+                            " AND COALESCE(kind, '') != 'pet'", (sid, active())).fetchall()
+        _update_metrics(conn, sid, [{**dict(r), "area": r["area"] or 0.0, "sharp": r["sharp"] or 0.0} for r in rows])
+
+
+# ---------------------------------------------------------------- how well each face is caught
+#
+# Apple Vision's face capture quality (VNDetectFaceCaptureQualityRequest): 0-1 for focus, light,
+# expression and how the head is turned, made for comparing captures of the same person. Judged once
+# per face, from its 200 px crop (cut from the 2048 px preview, so small faces in group shots are
+# judged at a useful size), in a pass of its own after faces are found; faces still to judge are found
+# from an index of only those (faces_unjudged). Scoring's faces part and Cull's face compare use it,
+# weighted so that it never decides on its own (scoring.caught).
+
+
+def vision_quality(items: list) -> list[float]:
+    """Apple Vision's capture quality of each face, given as (image path, (x, y, w, h) of the face in it,
+    fractions from the top left); -1 for one it couldn't judge."""
+    import Vision
+    from Foundation import NSURL
+
+    revision = getattr(Vision, "VNDetectFaceRectanglesRequestRevision3", 3)
+    out = []
+    for path, (x, y, w, h) in items:
+        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(NSURL.fileURLWithPath_(path), None)
+        req = Vision.VNDetectFaceCaptureQualityRequest.alloc().init()
+        face = Vision.VNFaceObservation.faceObservationWithRequestRevision_boundingBox_roll_yaw_pitch_(
+            revision, ((x, 1 - y - h), (w, h)), None, None, None)     # (Vision's origin is the bottom left)
+        req.setInputFaceObservations_([face])
+        res = handler.performRequests_error_([req], None)
+        ok = res[0] if isinstance(res, tuple) else res
+        got = (req.results() or []) if ok else []
+        q = got[0].faceCaptureQuality() if got else None
+        out.append(round(float(q), 4) if q is not None else -1.0)
+    return out
+
+
+def quality_pending(conn) -> list:
+    """Faces not judged yet, in photos in the library (never pets: they're stored as -1)."""
+    from . import pets
+
+    return conn.execute(
+        "SELECT f.id, f.shot_id, f.x, f.y, f.w, f.h, s.thumb, s.analyzed_fp FROM faces f INDEXED BY faces_unjudged"
+        " JOIN shots s ON s.id = f.shot_id WHERE f.quality IS NULL AND f.model != ? AND s.status = 'present'"
+        " ORDER BY f.shot_id, f.id", (pets.MODEL,)).fetchall()
+
+
+def _judge(rows: list, crop_dir) -> list[tuple[int, float]]:
+    """One photo's faces judged: from each face's crop, or the thumbnail when there's no crop."""
+    from PIL import Image
+
+    from .library import version_tag
+
+    try:
+        with Image.open(rows[0]["thumb"]) as im:
+            W, H = im.size
+    except Exception:
+        W = H = 0
+    items, ids, out = [], [], []
+    for r in rows:
+        w, h = r["w"] or 0, r["h"] or r["w"] or 0
+        crop = crop_dir / f"{r['id'] % 100:02d}" / f"{r['id']}_{version_tag(r['analyzed_fp'])}.jpg" if crop_dir else None
+        if not (w and W):
+            out.append((r["id"], -1.0))
+            continue
+        if crop is not None and crop.exists():
+            # The crop is a square 1.6 times the face's longer side, centred on it (as _write_crop's are cut).
+            fw, fh = w * W, h * H
+            bw, bh = fw / (1.6 * max(fw, fh)), fh / (1.6 * max(fw, fh))
+            items.append((str(crop), (0.5 - bw / 2, 0.5 - bh / 2, bw, bh)))
+        else:
+            items.append((r["thumb"], (r["x"], r["y"], w, h)))
+        ids.append(r["id"])
+    return out + list(zip(ids, vision_quality(items)))
+
+
+def measure_quality(conn, progress: Callable[[int, int], None] | None = None, batch: int = 64,
+                    errors: list | None = None) -> int:
+    """Judge the faces waiting for it (quality_pending), a batch of photos at a time, each batch saved in
+    one short write with its photos' quality (metrics.face_quality); a stop keeps what was saved. Apple
+    Vision not answering in VISION_TIMEOUT_S ends the pass for this update. Returns how many faces."""
+    from collections import defaultdict
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from pathlib import Path
+
+    from . import deadline
+
+    errors = errors if errors is not None else []
+    rows = quality_pending(conn)
+    if not rows:
+        return 0
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    crop_dir = Path(db_file).parent / "previews" / "faces" if db_file else None
+    by_shot: dict[int, list] = defaultdict(list)
+    for r in rows:
+        by_shot[r["shot_id"]].append(r)
+    shots = list(by_shot)
+    done = 0
+    with deadline.Pool(2, "vision") as pool:
+        for i in range(0, len(shots), batch):
+            chunk = shots[i : i + batch]
+            futs = {sid: pool.submit(_judge, by_shot[sid], crop_dir) for sid in chunk}
+            got, stuck = {}, False
+            for sid in chunk:
+                try:
+                    got[sid] = futs[sid].result(timeout=0 if stuck else config.VISION_TIMEOUT_S)
+                except FutureTimeout:
+                    if not stuck:
+                        errors.append((sid, f"Apple Vision didn't answer in {config.VISION_TIMEOUT_S:.0f} s; the rest"
+                                            " of the faces are judged in the next update"))
+                    stuck = True
+                except Exception as e:
+                    errors.append((sid, f"Apple Vision failed: {type(e).__name__}: {e}"))
+            for sid, judged in got.items():
+                conn.executemany("UPDATE faces SET quality=? WHERE id=?", [(q, fid) for fid, q in judged])
+                main = conn.execute("SELECT area, quality FROM faces WHERE shot_id=? AND model=? AND COALESCE(kind, '') != 'pet'"
+                                    " AND area >= ?", (sid, active(), MAIN_FACE_MIN_AREA)).fetchall()
+                conn.execute("UPDATE metrics SET face_quality=? WHERE shot_id=?", (_photo_quality([dict(m) for m in main]), sid))
+                done += len(judged)
+            conn.commit()
+            if progress:
+                progress(min(i + len(chunk), len(shots)), len(shots))
+            if stuck:
+                break
+    return done
 
 
 def _write_crop(crop_dir, fid: int, analyzed_fp: str, data: bytes) -> None:
@@ -570,25 +723,30 @@ def run(conn, force: bool = False, workers: int | None = None,
             for fut in as_completed([pool.submit(analyze_one, t) for t in tasks]):
                 yield fut.result()
 
+    from . import pets
+
     for r in results():
         done += 1
         if r["error"]:
             errors.append(f"shot {r['shot_id']}: {r['error']}")
         else:
             # Keep your naming: faces are replaced, but what you said about a face stays with the
-            # new face in the same place (and on a switch of models, its group too).
-            old = conn.execute("SELECT id, x, y, w, h, cluster, person_id, person_src, model FROM faces WHERE shot_id=?",
-                               (r["shot_id"],)).fetchall()
-            conn.execute("DELETE FROM faces WHERE shot_id=?", (r["shot_id"],))
+            # new face in the same place (and on a switch of models, its group too), as does your
+            # word that it's a person's, not an animal's (pets.put_back). The photo's pets (pets.py)
+            # aren't faces found here, and stay.
+            old = conn.execute("SELECT id, x, y, w, h, cluster, person_id, person_src, model, kind FROM faces WHERE shot_id=?"
+                               " AND model != ?", (r["shot_id"], pets.MODEL)).fetchall()
+            conn.execute("DELETE FROM faces WHERE shot_id=? AND model != ?", (r["shot_id"], pets.MODEL))
             fp = r["stamp"].rsplit(":", 1)[0]
-            for f, (cl, pid, src) in zip(r["faces"], _carry(old, r["faces"], key)):
+            said = [j is not None and old[j]["kind"] == "person" for j in same_place(old, r["faces"])]
+            for f, (cl, pid, src), person in zip(r["faces"], _carry(old, r["faces"], key), said):
                 crop = f.pop("crop", None)
                 fid = db.new_id(conn, "faces")
                 conn.execute(
                     "INSERT INTO faces(id, shot_id, x, y, w, h, px, area, sharp, closed, smile, vec, model, cluster,"
-                    " person_id, person_src) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " person_id, person_src, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (fid, r["shot_id"], f["x"], f["y"], f["w"], f["h"], f["px"], f["area"], f["sharp"], f["closed"],
-                     f["smile"], f["vec"], key, cl, pid, src))
+                     f["smile"], f["vec"], key, cl, pid, src, "person" if person else None))
                 if crop and crop_dir:
                     _write_crop(crop_dir, fid, fp, crop)
             if crop_dir:
@@ -609,6 +767,9 @@ def run(conn, force: bool = False, workers: int | None = None,
 # ---------------------------------------------------------------- clustering
 
 MIN_CLUSTER_PX = 48       # only reasonably sized faces seed clusters
+# The face's photo is in the library: photos that went are few, so this is a short list, and the faces
+# are read from an index instead of being joined to their photos one by one.
+PRESENT = "f.shot_id NOT IN (SELECT id FROM shots WHERE status < 'present' OR status > 'present')"
 
 
 FULL_EVERY_S = 24 * 3600     # a complete re-grouping at most daily; in between, new faces are placed
@@ -618,9 +779,21 @@ FULL_EVERY_S = 24 * 3600     # a complete re-grouping at most daily; in between,
 # models (limits()); UNCLEAR_SOFT_SHARP is the softness below which a group must agree better.
 
 
-def _vecs(rows) -> np.ndarray:
-    V = np.stack([np.frombuffer(r["vec"], dtype=np.float16).astype(np.float32) for r in rows])
+def _unit(vecs: np.ndarray, at: np.ndarray) -> np.ndarray:
+    """Rows `at` of vectors() as float32 of unit length (each row on its own, so a chunk at a time gives
+    the same numbers as all at once)."""
+    V = vecs[at].astype(np.float32)
     return V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-9)
+
+
+def _best(sims: np.ndarray, bar: float, k: int = 8) -> np.ndarray:
+    """The k highest of sims at or above bar, highest first: the ones np.argsort(-sims)[:k] gives before
+    its first below the bar, without sorting them all (sorting every group for every face took most of
+    a complete regrouping's time)."""
+    top = np.flatnonzero(sims >= bar)
+    if len(top) > k:
+        top = top[np.argpartition(-sims[top], k - 1)[:k]]
+    return top[np.argsort(-sims[top], kind="stable")]
 
 
 # ---------------------------------------------------------------- every face's vector, kept in memory
@@ -638,9 +811,10 @@ _VECTORS_LOCK = threading.Lock()
 NO_GROUP = -(1 << 62)            # a face in no group, in assignments()
 
 
-def vectors(conn) -> tuple[np.ndarray, np.ndarray]:
-    """(ids, vectors): every face the chosen models found, ids ascending, one float16 row each."""
-    model = active()
+def vectors(conn, model: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(ids, vectors): every face the chosen models found (or, given a model, every face that model
+    found: pets.MODEL for pets), ids ascending, one float16 row each."""
+    model = model or active()
     key = (conn.execute("PRAGMA database_list").fetchone()[2], model)
     own = not conn.in_transaction
     if own:
@@ -765,37 +939,121 @@ def cluster(conn, full: bool | None = None) -> dict:
     two people), and groups that share a photo are never merged.
 
     Named people (your assignments) anchor the groups. A complete re-grouping runs when asked, when
-    many faces are new, or at most once a day; otherwise only new faces are placed, in batches
-    against the existing groups, so a new photo doesn't re-group the whole library. Group ids are
-    stable (a group keeps the id most of its faces had) and never reused."""
+    many faces are new, or at most once a day when faces were found or named since the last; otherwise
+    only new faces are placed, in batches against the existing groups, so a new photo doesn't re-group
+    the whole library. Group ids are stable (a group keeps the id most of its faces had) and never
+    reused. What you say about a face while it runs (naming, "not this person") stands (_write_groups)."""
     key = active()
-    rows = conn.execute(
-        "SELECT f.id, f.shot_id, f.vec, f.px, f.sharp, f.person_id, f.person_src, f.cluster FROM faces f"
-        " JOIN shots s ON s.id=f.shot_id WHERE s.status='present' AND f.vec IS NOT NULL AND f.model=?", (key,)).fetchall()
-    if not rows:
-        return {"faces": 0, "clusters": 0}
-
     # Faces found since the last grouping have higher ids (a re-detected face gets a new one).
     # Small faces that matched nobody stay ungrouped without counting as new forever.
     seen = int(db.get_setting(conn, "faces_seen_upto", 0) or 0)
-    fresh = [r for r in rows if r["id"] > seen and r["cluster"] is None]
-    last_full = float(db.get_setting(conn, "faces_full_at", 0) or 0)
     # Newly chosen models: everything is grouped afresh (each face found again kept its group as a
     # hint, so groups keep their ids) until every photo's faces are found with them.
     switched = db.get_setting(conn, "faces_model", "insightface") != key
+    # Nothing new (after most updates, and after naming): told from the newest faces and an index, without
+    # reading every face's vector (seconds and over a gigabyte on a library of 300,000 faces).
+    if full is None and seen and not switched and not _fresh(conn, seen, key) and not _full_due(conn):
+        return {"faces": conn.execute(f"SELECT COUNT(*) FROM faces f WHERE {PRESENT}").fetchone()[0],
+                "clusters": conn.execute("SELECT COUNT(*) FROM face_groups").fetchone()[0], "placed": 0}
+    names, top = _names_stamp(conn), conn.execute("SELECT COALESCE(MAX(id), 0) FROM faces").fetchone()[0]
+    rows, at, vecs = _to_group(conn)
+    if not rows:
+        return {"faces": 0, "clusters": 0}
+
+    fresh = [i for i, r in enumerate(rows) if r["id"] > seen and r["cluster"] is None]
     if full is None:
-        full = (not seen or switched or len(fresh) > 0.25 * len(rows)
-                or time.time() - last_full > FULL_EVERY_S)
+        full = not seen or switched or len(fresh) > 0.25 * len(rows) or _full_due(conn)
     if not full and not fresh:
         return {"faces": len(rows), "clusters": len({r["cluster"] for r in rows if r["cluster"] is not None}), "placed": 0}
-    out = _cluster_full(conn, rows) if full else _place_new(conn, rows, fresh)
+    out = _cluster_full(conn, rows, at, vecs) if full else _place_new(conn, rows, at, vecs, fresh)
     if full:
+        # What this grouping was made from: the next daily one waits for faces or names newer than these.
         db.set_setting(conn, "faces_full_at", time.time())
+        db.set_setting(conn, "faces_full_upto", top)
+        db.set_setting(conn, "faces_full_names", names)
         if switched and not pending(conn):
             db.set_setting(conn, "faces_model", key)
     db.set_setting(conn, "faces_seen_upto", max(r["id"] for r in rows))
     _cohesion(conn)
     return out
+
+
+def animal_ids(conn) -> set[int]:
+    """Faces of kind 'pet', from the faces_kind index: pets themselves, and faces the face models found
+    that are an animal's (pets.py). Neither is grouped with people's faces."""
+    return {r[0] for r in conn.execute("SELECT id FROM faces WHERE kind = 'pet'")}
+
+
+def _to_group(conn) -> tuple[list, np.ndarray, np.ndarray]:
+    """The faces to group, the chosen models' faces in photos in the library (not animals'), ids
+    ascending: their rows (id, shot_id, px, sharp, person_id, person_src, cluster, from the faces_by_group
+    index rather than the faces' own rows), each one's row in vectors(), and those vectors."""
+    ids, vecs = vectors(conn)
+    rows = conn.execute("SELECT f.id, f.shot_id, f.px, f.sharp, f.person_id, f.person_src, f.cluster FROM faces f"
+                        f" WHERE {PRESENT}").fetchall()
+    fid = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+    at = rows_of(ids, fid)
+    animals = animal_ids(conn)
+    if animals:
+        at[np.isin(fid, np.fromiter(animals, dtype=np.int64, count=len(animals)))] = -1
+    keep = np.flatnonzero(at >= 0)                       # (other models' faces, and faces with no vector, aren't)
+    keep = keep[np.argsort(fid[keep], kind="stable")]
+    return [rows[i] for i in keep], at[keep], vecs
+
+
+def _fresh(conn, seen: int, key: str) -> bool:
+    """Whether a face found since the last grouping waits for a group: read from the newest faces' rows
+    only (ids only go up)."""
+    return conn.execute(f"SELECT 1 FROM faces f WHERE f.id > ? AND f.cluster IS NULL AND f.model = ? AND f.vec IS NOT NULL"
+                        f" AND COALESCE(f.kind, '') != 'pet' AND {PRESENT} LIMIT 1", (seen, key)).fetchone() is not None
+
+
+def _names_stamp(conn) -> list:
+    """What you've said about faces (names, and "not this person"), as two numbers that change when any
+    of it does (from the faces_by_person index)."""
+    n, s = conn.execute("SELECT COUNT(*), COALESCE(SUM(id * (person_id + 2)), 0) FROM faces"
+                        " WHERE person_id IS NOT NULL AND person_src = 'user'").fetchone()
+    return [n, s]
+
+
+def _full_due(conn) -> bool:
+    """The daily complete regrouping is due: a day since the last, and faces found or names given (or
+    taken off) since. With neither it would give the same groups again, after minutes under the update
+    lock on a big library."""
+    if time.time() - float(db.get_setting(conn, "faces_full_at", 0) or 0) <= FULL_EVERY_S:
+        return False
+    upto = db.get_setting(conn, "faces_full_upto")
+    if upto is None or conn.execute("SELECT COALESCE(MAX(id), 0) FROM faces").fetchone()[0] > upto:
+        return True
+    return db.get_setting(conn, "faces_full_names") != _names_stamp(conn)
+
+
+def _write_groups(conn, updates: list[tuple], was: dict[int, tuple]) -> int:
+    """Write a grouping: (cluster, person_id, person_src, face id) for each face, as it worked them out
+    from the faces as they were (was: each face's (cluster, person_id, person_src) then). A complete
+    regrouping takes minutes on a big library, and what you said about a face meanwhile (named it or
+    its group, took a name off, "not this person", merged two people) stands: each face's name is read
+    again under the write lock, and a face whose name changed keeps it. A person gone meanwhile (merged
+    into someone, forgotten) is given no faces. Only faces whose group or name changes are written.
+    Returns how many."""
+    conn.commit()
+    db.write_lock(conn)
+    now = {fid: (pid, src) for fid, pid, src in conn.execute(
+        "SELECT id, person_id, person_src FROM faces WHERE person_id IS NOT NULL")}
+    people = {r[0] for r in conn.execute("SELECT id FROM people")}
+    out = []
+    for cid, pid, src, fid in updates:
+        cl, *then = was[fid]
+        cur = now.get(fid, (None, None))
+        if cur != tuple(then):
+            pid, src = cur                                   # yours, since the grouping read it
+        elif src == "auto" and pid not in people:
+            pid = src = None
+        if (cid, pid, src) != (cl, *cur):
+            out.append((cid, pid, src, fid))
+    conn.executemany("UPDATE faces SET cluster=?, person_id=?, person_src=? WHERE id=?", out)
+    conn.commit()
+    return len(out)
 
 
 def _new_cluster_id(conn) -> int:
@@ -808,16 +1066,20 @@ def _new_cluster_id(conn) -> int:
     return nid
 
 
-def _cluster_full(conn, rows) -> dict:
-    lim = limits()
+def _cluster_full(conn, rows, at: np.ndarray, vecs: np.ndarray, lim: dict | None = None) -> dict:
+    """Group every face afresh (rows: as _to_group gives them; at: each one's row in vecs; lim: the
+    bars, the chosen models' unless given: pets have their own)."""
+    lim = lim or limits()
     n = len(rows)
+    dim = vecs.shape[1]
     ids = np.array([r["id"] for r in rows])
     shot = np.array([r["shot_id"] for r in rows])
-    V = _vecs(rows)
-    order = np.argsort([-(r["px"] * min(r["sharp"] or 0, 500)) for r in rows])
+    # Biggest and sharpest first; between equals, the face found first (rows are by id), so the groups
+    # don't depend on the order the catalog happens to read the faces in.
+    order = np.argsort([-(r["px"] * min(r["sharp"] or 0, 500)) for r in rows], kind="stable")
     labels = np.full(n, -1)
     cap = 1024
-    C = np.zeros((cap, V.shape[1]), dtype=np.float32)   # running sums
+    C = np.zeros((cap, dim), dtype=np.float32)          # running sums
     norms = np.zeros(cap, dtype=np.float32)
     shots_in: list[set] = []
     k = 0
@@ -837,42 +1099,42 @@ def _cluster_full(conn, rows) -> dict:
         return k - 1
 
     # Faces you assigned seed one group per person.
-    for i, r in enumerate(rows):
-        if r["person_src"] == "user" and r["person_id"] and r["person_id"] > 0:
-            c = cluster_of_person.get(r["person_id"])
-            if c is None:
-                c = new_cluster(np.zeros(V.shape[1], dtype=np.float32))
-                cluster_of_person[r["person_id"]] = c
-                person_of_cluster[c] = r["person_id"]
-            labels[i] = c
-            C[c] += V[i]
-            norms[c] = float(np.linalg.norm(C[c]))
-            shots_in[c].add(int(shot[i]))
+    seeds = [i for i, r in enumerate(rows) if r["person_src"] == "user" and r["person_id"] and r["person_id"] > 0]
+    for i, v in zip(seeds, _unit(vecs, at[seeds])):
+        r = rows[i]
+        c = cluster_of_person.get(r["person_id"])
+        if c is None:
+            c = new_cluster(np.zeros(dim, dtype=np.float32))
+            cluster_of_person[r["person_id"]] = c
+            person_of_cluster[c] = r["person_id"]
+        labels[i] = c
+        C[c] += v
+        norms[c] = float(np.linalg.norm(C[c]))
+        shots_in[c].add(int(shot[i]))
     locked_out = {r["id"] for r in rows if r["person_src"] == "user" and (r["person_id"] or 0) <= 0}
 
-    for i in order:
-        if labels[i] >= 0:
-            continue
-        v = V[i]
-        chosen = -1
-        if k:
-            sims = (C[:k] @ v) / (norms[:k] + 1e-9)
-            for c in np.argsort(-sims)[:8]:
-                if sims[c] < lim["cluster"]:
+    for a0 in range(0, n, 4096):                         # (the vectors as float32 a chunk at a time)
+        chunk = order[a0 : a0 + 4096]
+        for i, v in zip(chunk, _unit(vecs, at[chunk])):
+            if labels[i] >= 0:
+                continue
+            chosen = -1
+            if k:
+                sims = (C[:k] @ v) / (norms[:k] + 1e-9)
+                for c in _best(sims, lim["cluster"]):
+                    if int(shot[i]) in shots_in[c] or (ids[i] in locked_out and int(c) in person_of_cluster):
+                        continue          # already someone else in this photo: a different person
+                    chosen = int(c)
                     break
-                if int(shot[i]) in shots_in[c] or (ids[i] in locked_out and int(c) in person_of_cluster):
-                    continue          # already someone else in this photo: a different person
-                chosen = int(c)
-                break
-        if chosen >= 0:
-            labels[i] = chosen
-        elif rows[i]["px"] >= MIN_CLUSTER_PX or not k:
-            chosen = labels[i] = new_cluster(np.zeros(V.shape[1], dtype=np.float32))
-        else:
-            continue
-        C[chosen] += v
-        norms[chosen] = float(np.linalg.norm(C[chosen]))
-        shots_in[chosen].add(int(shot[i]))
+            if chosen >= 0:
+                labels[i] = chosen
+            elif rows[i]["px"] >= MIN_CLUSTER_PX or not k:
+                chosen = labels[i] = new_cluster(np.zeros(dim, dtype=np.float32))
+            else:
+                continue
+            C[chosen] += v
+            norms[chosen] = float(np.linalg.norm(C[chosen]))
+            shots_in[chosen].add(int(shot[i]))
 
     # Merge near-identical groups: never two different named people, never two groups that share
     # a photo. Only candidate pairs above the bar are visited.
@@ -927,25 +1189,25 @@ def _cluster_full(conn, rows) -> dict:
         else:
             pid = person_of_cluster.get(lab) if lab >= 0 else None
             updates.append((cid, pid, "auto" if pid else None, int(ids[i])))
-    conn.executemany("UPDATE faces SET cluster=?, person_id=?, person_src=? WHERE id=?", updates)
-    conn.commit()
+    _write_groups(conn, updates, {r["id"]: (r["cluster"], r["person_id"], r["person_src"]) for r in rows})
     return {"faces": n, "clusters": len(mapping), "full": True}
 
 
-def _place_new(conn, rows, new) -> dict:
-    """Put new faces into the existing groups, a batch at a time (one matrix product per batch);
-    faces that fit nowhere start groups of their own."""
-    old = [r for r in rows if r["cluster"] is not None]
-    if not old:
-        return _cluster_full(conn, rows)
+def _place_new(conn, rows, at: np.ndarray, vecs: np.ndarray, fresh: list[int]) -> dict:
+    """Put new faces (fresh: their places in rows) into the existing groups, a batch at a time (one
+    matrix product per batch); faces that fit nowhere start groups of their own."""
+    olds = [i for i, r in enumerate(rows) if r["cluster"] is not None]
+    if not olds:
+        return _cluster_full(conn, rows, at, vecs)
     bar = limits()["cluster"]
-    new = list(new)
+    old = [rows[i] for i in olds]
     labels_old = np.array([r["cluster"] for r in old])
     groups = np.unique(labels_old)
     gi = {int(g): k for k, g in enumerate(groups)}
-    Vo = _vecs(old)
-    C = np.zeros((len(groups), Vo.shape[1]), dtype=np.float32)
-    np.add.at(C, np.array([gi[int(c)] for c in labels_old]), Vo)
+    which = np.array([gi[int(c)] for c in labels_old])
+    C = np.zeros((len(groups), vecs.shape[1]), dtype=np.float32)
+    for a in range(0, len(olds), 32768):                # (float32 a chunk at a time; added in the same order)
+        np.add.at(C, which[a : a + 32768], _unit(vecs, at[olds[a : a + 32768]]))
     Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-9)
     shots_in: dict[int, set] = {}
     person: dict[int, tuple] = {}
@@ -953,18 +1215,17 @@ def _place_new(conn, rows, new) -> dict:
         shots_in.setdefault(r["cluster"], set()).add(r["shot_id"])
         if r["person_id"] and r["person_id"] > 0:
             person[r["cluster"]] = (r["person_id"], "auto")
+    fresh = sorted(fresh, key=lambda i: -(rows[i]["px"] * min(rows[i]["sharp"] or 0, 500)))
+    new = [rows[i] for i in fresh]
     locked_out = {r["id"] for r in new if r["person_src"] == "user" and (r["person_id"] or 0) <= 0}
-    new.sort(key=lambda r: -(r["px"] * min(r["sharp"] or 0, 500)))
-    Vn = _vecs(new)
+    Vn = _unit(vecs, at[fresh])
     updates, leftovers = [], []
     for b0 in range(0, len(new), 2048):
         S = Vn[b0 : b0 + 2048] @ Cn.T if len(groups) else np.zeros((min(2048, len(new) - b0), 0))
         for j in range(S.shape[0]):
             r = new[b0 + j]
             chosen = None
-            for k in np.argsort(-S[j])[:8] if S.shape[1] else []:
-                if S[j, k] < bar:
-                    break
+            for k in _best(S[j], bar):
                 g = int(groups[k])
                 if r["shot_id"] in shots_in[g] or (r["id"] in locked_out and g in person):
                     continue
@@ -996,36 +1257,47 @@ def _place_new(conn, rows, new) -> dict:
             made[target] = (cv + v, shots | {r["shot_id"]}, cid)
         updates.append((made[target][2], r["person_id"] if r["person_src"] == "user" else None,
                         "user" if r["person_src"] == "user" else None, r["id"]))
-    conn.executemany("UPDATE faces SET cluster=?, person_id=?, person_src=? WHERE id=?", updates)
-    conn.commit()
+    _write_groups(conn, updates, {r["id"]: (r["cluster"], r["person_id"], r["person_src"]) for r in new})
     return {"faces": len(rows), "clusters": len(groups) + len(made), "placed": len(updates), "full": False}
+
+
+def place(conn, face_ids) -> int:
+    """Put these faces, if in no group, into the groups they fit (as new faces are placed, _place_new):
+    faces put back among people's (pets.put_back). Returns how many found a group."""
+    want = {int(x) for x in face_ids}
+    rows, at, vecs = _to_group(conn)
+    fresh = [i for i, r in enumerate(rows) if r["id"] in want and r["cluster"] is None]
+    if not fresh:
+        return 0
+    return _place_new(conn, rows, at, vecs, fresh)["placed"]
 
 
 def _cohesion(conn) -> None:
     """How well each group's faces agree, and how many photos have two of its faces (which would
-    mean two people): People sets loose groups aside as "unclear faces"."""
-    rows = conn.execute("SELECT f.cluster, f.shot_id, f.vec, f.sharp FROM faces f JOIN shots s ON s.id=f.shot_id"
-                        " WHERE s.status='present' AND f.cluster IS NOT NULL AND f.vec IS NOT NULL AND f.model=?"
-                        " ORDER BY f.cluster", (active(),)).fetchall()
+    mean two people): People sets loose groups aside as "unclear faces". Who is in which group comes
+    from the faces_by_group index, and their vectors from vectors()."""
+    ids, vecs = vectors(conn)
+    rows = conn.execute(f"SELECT f.id, f.cluster, f.shot_id, COALESCE(f.sharp, 0) FROM faces f"
+                        f" WHERE f.cluster IS NOT NULL AND {PRESENT}").fetchall()
+    a = np.fromiter(itertools.chain.from_iterable(rows), dtype=np.float64, count=4 * len(rows)).reshape(-1, 4)
+    fid, cl, shot = a[:, 0].astype(np.int64), a[:, 1].astype(np.int64), a[:, 2].astype(np.int64)
+    at = rows_of(ids, fid)
+    keep = np.flatnonzero(at >= 0)                       # the chosen models' faces
+    keep = keep[np.lexsort((fid[keep], cl[keep]))]       # by group
+    cl, shot, sharp, at = cl[keep], shot[keep], a[keep, 3], at[keep]
+    starts = np.flatnonzero(np.r_[True, cl[1:] != cl[:-1]]) if len(cl) else np.zeros(0, dtype=np.int64)
     out = []
-    i = 0
-    while i < len(rows):
-        c = rows[i]["cluster"]
-        j = i
-        while j < len(rows) and rows[j]["cluster"] == c:
-            j += 1
-        group = rows[i:j]
-        V = _vecs(group)
+    for i, j in zip(starts, np.r_[starts[1:], len(cl)].astype(np.int64)):
+        V = _unit(vecs, at[i:j])
         cen = V.sum(0)
         cen /= np.linalg.norm(cen) + 1e-9
-        per_shot = {}
-        for r in group:
-            per_shot[r["shot_id"]] = per_shot.get(r["shot_id"], 0) + 1
-        out.append((c, len(group), float(np.median(V @ cen)), sum(1 for v in per_shot.values() if v > 1),
-                    float(np.median([r["sharp"] or 0 for r in group]))))
-        i = j
-    conn.execute("DELETE FROM face_groups")
-    conn.executemany("INSERT INTO face_groups(cluster, faces, cohesion, shared_photos, sharp) VALUES (?,?,?,?,?)", out)
+        _, per_shot = np.unique(shot[i:j], return_counts=True)
+        out.append((int(cl[i]), int(j - i), float(np.median(V @ cen)), int((per_shot > 1).sum()),
+                    float(np.median(sharp[i:j]))))
+    # (Pets' groups are measured with pets' vectors, by pets.cluster, and kept: from the faces_kind index.)
+    conn.execute("DELETE FROM face_groups WHERE cluster NOT IN (SELECT cluster FROM faces WHERE kind = 'pet'"
+                 " AND cluster IS NOT NULL)")
+    conn.executemany("INSERT OR REPLACE INTO face_groups(cluster, faces, cohesion, shared_photos, sharp) VALUES (?,?,?,?,?)", out)
     conn.commit()
 
 
@@ -1055,8 +1327,12 @@ def name_cluster(conn, cluster_id: int, person_id: int) -> int:
                  " (person_id IS NULL OR person_id <= 0 OR person_src='auto') AND"
                  " NOT (COALESCE(person_src, '') = 'user' AND COALESCE(person_id, 0) = -1)", (person_id, cluster_id))
     # The groups that could join (nobody's, or this person's by the grouping) and the named one, from the
-    # faces_by_group index; their vectors from vectors() (the chosen models' faces only).
-    ids, vecs = vectors(conn)
+    # faces_by_group index; their vectors from vectors() (the chosen models' faces only, or a pet group's
+    # from pets.vectors: only other pets' groups can join it).
+    from . import pets
+
+    pet = pets.is_pet_group(conn, cluster_id)
+    ids, vecs = pets.vectors(conn) if pet else vectors(conn)
     rows = conn.execute("SELECT id, cluster, shot_id FROM faces WHERE cluster IS NOT NULL AND"
                         " ((person_id IS NULL OR person_id <= 0 OR person_id = ?) AND COALESCE(person_src, '') != 'user'"
                         " OR cluster = ?)", (person_id, cluster_id)).fetchall()
@@ -1072,11 +1348,13 @@ def name_cluster(conn, cluster_id: int, person_id: int) -> int:
     sims = centres @ me
     sims[i] = -1.0
     # The photos the person is in, and which groups those faces are in (None: a face named on its own).
+    # (For a pet, its own boxes only: a dog's face the face models found in the same photo is the same dog.)
     theirs: dict[int, set] = {}
-    for sid, cl in conn.execute("SELECT shot_id, cluster FROM faces WHERE person_id=?", (person_id,)):
+    for sid, cl in conn.execute("SELECT shot_id, cluster FROM faces WHERE person_id=?" + (" AND model = ?" if pet else ""),
+                                (person_id, pets.MODEL) if pet else (person_id,)):
         theirs.setdefault(sid, set()).add(cl)
     order = np.argsort(-sims, kind="stable")
-    bar = limits()["merge"]
+    bar = limits(pets.MODEL if pet else None)["merge"]
     joined = 0
     for j in order:                              # the most alike first
         if sims[j] < bar:
@@ -1215,6 +1493,9 @@ def _edge_centres(u: dict, side: str, vecs: np.ndarray) -> np.ndarray:
 def across_years(conn, limit: int = 30) -> list[dict]:
     """Unnamed groups that may be someone you've named, younger or older: [{person, cluster,
     direction, gap_years, similarity, person_faces, group_faces, group_years}], likeliest first."""
+    if not conn.execute("SELECT 1 FROM faces f JOIN people p ON p.id = f.person_id WHERE f.person_id > 0"
+                        " AND f.person_src = 'user' AND COALESCE(p.hidden, 0) = 0 LIMIT 1").fetchone():
+        return []                       # nobody named (from the faces_by_person index): no one to compare with
     P, G = _units(conn)
     if not len(P["keys"]) or not len(G["keys"]):
         return []

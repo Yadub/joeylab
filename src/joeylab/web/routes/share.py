@@ -13,11 +13,12 @@ from pathlib import Path
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
-from ... import config, db, export, library, portable
+from ... import config, db, export, library, locks, portable
 from ...library import Filter
-from ..deps import conn_dep, filter_from, ids_of, is_owner, require_owner, require_writer, viewer_of
+from ..deps import conn_dep, filter_for, ids_of, is_owner, require_owner, require_writer, viewer_of
 
 router = APIRouter()
+XMP_LOCK_WAIT_S = 60          # the request waits only so long for an update of the library to finish
 
 # The photos an event or trip link was made with. Events are found again on every update and may be
 # regrouped; a link keeps showing what it showed when it was made (older links follow their event).
@@ -44,7 +45,7 @@ def api_albums(p: str, light: int = 0, conn=Depends(conn_dep)):
         d = dict(a)
         if d["kind"] == "smart" and d["query"]:
             try:
-                flt = filter_from(json.loads(d["query"]))
+                flt = filter_for(conn, json.loads(d["query"]))
                 w, args = flt.sql()
                 d["items"] = d["present"] = conn.execute(f"SELECT COUNT(*) {library.LIGHT_FROM}{w}", args).fetchone()[0]
                 top, _ = library.page(conn, flt, sort="quality", limit=1, with_total=False)
@@ -77,7 +78,14 @@ def api_create_album(p: str, request: Request, body: dict = Body(default_factory
     conn.commit()
     ids = ids_of(body.get("ids"))
     if ids is None and body.get("filter") is not None:
-        ids = [r["id"] for r in library.shots(conn, filter_from(body["filter"], viewer_of(request)))]
+        from .library import browse_filter
+
+        # What the Library shows for this filter (and what "Save all N" counted): without the photos browsing
+        # hides (thumbnail-sized ones, extra copies, screenshots) unless the filter asks for everything.
+        flt = filter_for(conn, body["filter"], viewer_of(request))
+        if str(body["filter"].get("all")) not in ("1", "true"):
+            flt = browse_filter(conn, flt)
+        ids = [r["id"] for r in library.shots(conn, flt)]
     added = portable.add_to_album(conn, aid, ids or [])
     return {"id": aid, "added": added}
 
@@ -100,7 +108,7 @@ def api_album_items(p: str, aid: int, request: Request, body: dict = Body(defaul
         if body.get("op") not in ("add", "remove"):
             raise HTTPException(400, "Say whether to add the matching photos or remove them (op).")
         q = body["filter"]
-        flt = filter_from(q, viewer_of(request))
+        flt = filter_for(conn, q, viewer_of(request))
         if str(q.get("all")) not in ("1", "true"):
             flt = browse_filter(conn, flt)
         ids = [r["id"] for r in library.shots(conn, flt)]
@@ -146,8 +154,8 @@ def api_album_filter(p: str, aid: int, conn=Depends(conn_dep)):
 
 
 # ------------------------------------------------------------ exports (never into tracked folders)
-def _export_filter(body, request: Request) -> Filter:
-    flt = filter_from(body.get("filter") or {}, viewer_of(request))
+def _export_filter(conn, body, request: Request) -> Filter:
+    flt = filter_for(conn, body.get("filter") or {}, viewer_of(request))
     if body.get("ids"):
         flt.ids = ids_of(body["ids"])
     return flt
@@ -163,7 +171,7 @@ def api_album_folder(p: str, request: Request, body: dict = Body(default_factory
     if which not in export.FILE_CHOICES:
         raise HTTPException(400, f"files must be one of {', '.join(export.FILE_CHOICES)}")
     try:
-        r = export.album(conn, _export_filter(body, request), dest, which=which, copy=bool(body.get("copy")),
+        r = export.album(conn, _export_filter(conn, body, request), dest, which=which, copy=bool(body.get("copy")),
                          clean=bool(body.get("clean")))
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -173,7 +181,7 @@ def api_album_folder(p: str, request: Request, body: dict = Body(default_factory
 @router.get("/api/p/{p}/export/list")
 def api_list(p: str, request: Request, conn=Depends(conn_dep)):
     q = dict(request.query_params)
-    paths = export.paths(conn, _export_filter({"filter": q, "ids": q.get("ids")}, request), which=q.get("files", "all"))
+    paths = export.paths(conn, _export_filter(conn, {"filter": q, "ids": q.get("ids")}, request), which=q.get("files", "all"))
     return Response("\n".join(paths) + ("\n" if paths else ""), media_type="text/plain",
                     headers={"Content-Disposition": f'attachment; filename="{p}-paths.txt"'})
 
@@ -181,7 +189,7 @@ def api_list(p: str, request: Request, conn=Depends(conn_dep)):
 @router.get("/api/p/{p}/export/csv")
 def api_csv(p: str, request: Request, conn=Depends(conn_dep)):
     q = dict(request.query_params)
-    rows = library.shots(conn, _export_filter({"filter": q, "ids": q.get("ids")}, request))
+    rows = library.shots(conn, _export_filter(conn, {"filter": q, "ids": q.get("ids")}, request))
     buf = io.StringIO()
     csv.writer(buf).writerows(export.csv_rows(conn, rows))
     return Response(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{p}.csv"'})
@@ -196,10 +204,16 @@ def api_xmp(p: str, request: Request, body: dict = Body(default_factory=dict), c
     if style not in ("stem", "full"):
         raise HTTPException(400, "style must be stem or full")
     include = tuple(body.get("include") or ("rating", "label"))
-    r = export.write_sidecars(conn, _export_filter(body, request), style=style,
-                              update_existing=bool(body.get("update_existing")), include=include, project=p)
+    try:
+        # The library's update lock: a scan reads ratings from sidecars, so never one half written.
+        with locks.project_lock(p, wait=XMP_LOCK_WAIT_S):
+            r = export.write_sidecars(conn, _export_filter(conn, body, request), style=style,
+                                      update_existing=bool(body.get("update_existing")), include=include, project=p)
+    except locks.Busy:
+        raise HTTPException(409, "An update of this library is running, so no sidecars were written. "
+                                 "Try again when it finishes.")
     return {"written": r.written, "updated": r.updated, "skipped_existing": r.skipped_existing,
-            "kept_theirs": r.kept_theirs, "errors": r.errors[:20], "backup_dir": r.backup_dir}
+            "kept_theirs": r.kept_theirs, "errors": r.errors[:20], "error_count": len(r.errors), "backup_dir": r.backup_dir}
 
 
 @router.post("/api/p/{p}/export/xmp/restore")
@@ -250,7 +264,7 @@ def api_gallery(p: str, request: Request, body: dict = Body(default_factory=dict
         return images["render"](p, r, "", 2048)
 
     try:
-        return portable.export_gallery(conn, _export_filter(body, request), Path(body.get("dest") or "").expanduser(),
+        return portable.export_gallery(conn, _export_filter(conn, body, request), Path(body.get("dest") or "").expanduser(),
                                        body.get("title") or p, render)
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -398,7 +412,7 @@ def _live_ids(conn, kind: str, ref: str) -> list[int]:
         a = conn.execute("SELECT kind, query FROM albums WHERE id=?", (int(ref),)).fetchone()
         if not a:
             return []
-        flt = filter_from(json.loads(a["query"])) if a["kind"] == "smart" and a["query"] else Filter(album_id=int(ref))
+        flt = filter_for(conn, json.loads(a["query"])) if a["kind"] == "smart" and a["query"] else Filter(album_id=int(ref))
     else:
         e = conn.execute("SELECT kind FROM events WHERE id=?", (int(ref),)).fetchone()
         if not e:

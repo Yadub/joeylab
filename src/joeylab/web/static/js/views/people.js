@@ -70,9 +70,10 @@ export function mount(root, ctx) {
     meId = d.me ?? null;
     everyone = d.people.concat(d.pets || [], d.hidden || []);
     const named = d.people.length + (d.pets || []).length;
+    const toName = (d.groups_total || 0) + (d.pet_groups_total || 0);
     const panel = h("div", { class: "stack-v", style: { gap: "28px" } });
     const tabs = tabBar([["people", `People${named ? " · " + n(named) : ""}`],
-      ["stream", `Name faces${d.groups_total ? " · " + n(d.groups_total) : ""}`], ["together", "Together"]], tab,
+      ["stream", `Name faces${toName ? " · " + n(toName) : ""}`], ["together", "Together"]], tab,
     (k) => { tab = k; ctx.setParams({ tab: k }); render(); }, { label: "People", id: "people", panel });
     panel.append(tab === "people" ? peopleTab(d) : tab === "stream" ? streamTab(d) : togetherTab());
     clear(page).append(
@@ -81,7 +82,7 @@ export function mount(root, ctx) {
           h("div", { class: "sub" }, !d.recognition ? "Face recognition is off until you turn it on."
             : !d.enabled ? "Face recognition is off for this library."
             : !d.available ? "Face recognition isn't installed. To add it: uv sync --extra faces"
-              : d.faces ? `${plural(d.faces, "face")} found. Name a group once and JoeyLab finds that person everywhere.`
+              : d.faces ? `${plural(d.faces, "face")}${d.pets_found ? ` and ${plural(d.pets_found, "pet")}` : ""} found. Name a group once and JoeyLab finds them everywhere.`
                 : reading ? "Looking for faces while JoeyLab reads your photos. They appear here as it finishes."
                   : "Name a group of faces once and JoeyLab finds that person everywhere.")),
         h("div", { class: "actions" }, tabs)),
@@ -362,7 +363,7 @@ export function mount(root, ctx) {
   // ------------------------------------------------------------ naming stream
   function streamTab(d) {
     const nothing = noFaces(d);
-    if (nothing) return nothing;
+    if (nothing && !d.pet_groups?.length) return nothing;
     const host = h("div", { class: "stack-v", style: { gap: "24px" } });
     const datalist = h("datalist", { id: "people-names" }, nameOptions(d.people.concat(d.pets)));
     host.append(datalist);
@@ -374,7 +375,7 @@ export function mount(root, ctx) {
       if (!s.suggestions.length) { quick.remove(); return; }
       let i = 0;
       const card = h("div", { class: "ask-card" });
-      const likely = (x) => (x.similarity >= 0.5 ? "very likely the same person" : x.similarity >= 0.4 ? "likely the same person" : "possibly the same person");
+      const likely = (x) => `${{ very: "very likely", likely: "likely" }[x.likely] || "possibly"} the same ${x.kind === "pet" ? "pet" : "person"}`;
       const faces = (ids) => h("div", { class: "ask-faces" }, ids.filter(Boolean).map((fid) => h("img", { src: faceUrl(fid), alt: "", loading: "lazy" })));
       const paint = () => {
         const x = s.suggestions[i];
@@ -455,10 +456,21 @@ export function mount(root, ctx) {
     }).catch(() => quick.remove());
 
     if (d.people.length) host.append(acrossYears());
+    if (d.pet_groups?.length) {
+      // Dogs and cats Apple Vision found, grouped by how alike they look. Named once, a pet is asked about
+      // in its other groups ("Is this Joey?" above).
+      host.append(h("section", { class: "section" },
+        h("h2", {}, "Pets to name"),
+        h("p", { class: "note" }, "Dogs and cats, grouped by how alike they look. Name your pet's biggest group and JoeyLab asks about its other groups above. ",
+          h("kbd", {}, "Esc"), " then ", h("kbd", {}, "S"), " hides a group as not yours, ", h("kbd", {}, "X"), " as not an animal."),
+        h("div", { class: "people-grid" }, d.pet_groups.map((g) => groupCard(g, true)))));
+    }
+    if (d.animal_faces) host.append(animalFaces(d.animal_faces));
+    if (nothing) { host.append(nothing); return host; }
     let left = d.groups_total ?? d.groups.length;
     const leftEl = h("span", { class: "muted n" }, `${plural(left, "group")} left`);
     groupsLeft = (k) => { left = Math.max(0, left - k); leftEl.textContent = `${plural(left, "group")} left`; };
-    groupGrid = h("div", { class: "people-grid" }, (showAll ? d.groups : d.groups.slice(0, FIRST)).map(groupCard));
+    groupGrid = h("div", { class: "people-grid" }, (showAll ? d.groups : d.groups.slice(0, FIRST)).map((g) => groupCard(g)));
     host.append(h("section", { class: "section" },
       h("div", { class: "row", style: { justifyContent: "space-between", alignItems: "baseline" } },
         h("h2", {}, d.people.length ? "Still to name" : "Who's who"), d.groups.length ? leftEl : null),
@@ -467,15 +479,44 @@ export function mount(root, ctx) {
       d.groups.length ? null : h("div", { class: "muted" }, "Everyone recognisable has a name."),
       groupGrid,
       !showAll && d.groups_total > FIRST ? h("button", { class: "btn", onclick: () => { showAll = true; render(); } }, `Show all ${n(d.groups_total)} groups`) : null,
-      d.smaller_groups && !showSmall ? h("button", { class: "btn ghost", onclick: () => { showSmall = true; showAll = true; render(); } },
-        `Show ${plural(d.smaller_groups, "face")} seen in only one photo`) : null));
+      (d.smaller_groups || d.smaller_pet_groups) && !showSmall ? h("button", { class: "btn ghost", onclick: () => { showSmall = true; showAll = true; render(); } },
+        `Show ${[d.smaller_groups ? plural(d.smaller_groups, "face") : "", d.smaller_pet_groups ? plural(d.smaller_pet_groups, "pet") : ""].filter(Boolean).join(" and ")} seen in only one photo`) : null));
     if (d.unclear?.length) {
       host.append(h("details", { class: "section unclear-faces" },
         h("summary", { class: "label" }, `Unclear faces · ${plural(d.unclear.length, "group")}`),
         h("p", { class: "note" }, "These groups mix blurred, turned-away and partial faces (and the odd dog) rather than showing one person, so they're kept out of the way. Name any that are really one person, or mark them as strangers or not faces."),
-        h("div", { class: "people-grid" }, d.unclear.map(groupCard))));
+        h("div", { class: "people-grid" }, d.unclear.map((g) => groupCard(g)))));
     }
     return host;
+  }
+
+  // Faces the face models found on a dog or cat where Apple Vision sees no one: kept out of people's
+  // groups. Any that's a person's goes back with one press, and Undo sets it aside again.
+  function animalFaces(total) {
+    const grid = h("div", { class: "face-review" });
+    const box = h("details", { class: "section" },
+      h("summary", { class: "label" }, `Animals' faces · ${n(total)}`),
+      h("p", { class: "note" }, "Faces found on a dog or cat where no one is, so they're kept out of people's groups. If one is a person's, choose A person."),
+      grid);
+    box.addEventListener("toggle", async () => {
+      if (!box.open || grid.childElementCount) return;
+      let d;
+      try { d = await api(P(p, "/people/animal-faces")); } catch (e) { toast(e.message, { kind: "error" }); return; }
+      const kind = (f, k) => api(P(p, "/faces/kind"), { method: "POST", body: { faces: [f.id], kind: k } });
+      grid.append(...d.faces.map((f) => {
+        const cell = h("div", { class: "fr" },
+          h("img", { src: faceUrl(f.id), alt: "", loading: "lazy" }),
+          h("button", { class: "btn small ghost", type: "button", title: "A person's face: back among people's faces", onclick: async () => {
+            try { await kind(f, "person"); } catch (e) { toast(e.message, { kind: "error" }); return; }
+            cell.hidden = true;
+            toast("Back among people's faces", { action: async () => {
+              try { await kind(f, "pet"); cell.hidden = false; } catch (e) { toast(e.message, { kind: "error" }); }
+            } });
+          } }, "A person"));
+        return cell;
+      }));
+    });
+    return box;
   }
 
   // Children change year by year, so they end up in one group per age. These join them up.
@@ -530,14 +571,15 @@ export function mount(root, ctx) {
   function gone(card, joined = 0, toInput = true) {
     const next = nextCard(card) || nextCard(card, true);
     card.remove();
-    groupsLeft(1 + joined);
+    if (!card.dataset.pet) groupsLeft(1 + joined);           // (the count is of people's groups)
     if (next) (toInput ? next.querySelector("input.input") : next)?.focus();
   }
 
   /** A group named from the questions above the list: its card (and any group that joined it) goes. */
   function namedElsewhere(cluster, r) {
-    page.querySelector(`.person-card.group[data-cluster="${cluster}"]`)?.remove();
-    groupsLeft(1 + (r?.joined || 0));
+    const card = page.querySelector(`.person-card.group[data-cluster="${cluster}"]`);
+    card?.remove();
+    if (!card?.dataset.pet) groupsLeft(1 + (r?.joined || 0));
     if (r?.joined && r.id) dropJoined(r.id);
   }
 
@@ -554,15 +596,17 @@ export function mount(root, ctx) {
     });
   }
 
-  function groupCard(g) {
+  /** A group still to name: of faces, or with `animal`, of pets (named as pets, hidden as not yours). */
+  function groupCard(g, animal = false) {
     const input = h("input", { class: "input", placeholder: "Who is this?", list: "people-names", "aria-label": `Who is this? A group in ${plural(g.photos, "photo")}`,
       onkeydown: (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); card.focus(); } } });
-    const pet = h("input", { type: "checkbox", title: "A pet" });
-    const card = h("div", { class: "person-card group", tabindex: "-1", dataset: { cluster: g.cluster, faces: (g.sample || []).join(",") }, onkeydown: (e) => {
+    const pet = h("input", { type: "checkbox", title: "A pet", checked: !!animal });
+    const [hideAs, notAs] = animal ? ["Other animals", "Not an animal"] : ["Strangers", "Not a face"];
+    const card = h("div", { class: "person-card group", tabindex: "-1", dataset: { cluster: g.cluster, faces: (g.sample || []).join(","), pet: animal ? "1" : "" }, onkeydown: (e) => {
       if (e.target !== card || e.metaKey || e.ctrlKey || e.altKey) return;
       const k = e.key.toLowerCase();
-      if (k === "s") ignore(g, "Strangers", card);
-      else if (k === "x") ignore(g, "Not a face", card);
+      if (k === "s") ignore(g, hideAs, card);
+      else if (k === "x") ignore(g, notAs, card);
       else if (k === "enter") input.focus();
       else if (k === "arrowright" || k === "arrowdown") nextCard(card)?.focus();
       else if (k === "arrowleft" || k === "arrowup") nextCard(card, true)?.focus();
@@ -574,7 +618,8 @@ export function mount(root, ctx) {
       const name = input.value.trim();
       if (!name) return;
       try {
-        const r = await api(P(p, "/people/name"), { method: "POST", body: { cluster: g.cluster, name, kind: pet.checked ? "pet" : undefined } });
+        // (A pets' group makes a new name a pet by itself; someone named already stays as they are.)
+        const r = await api(P(p, "/people/name"), { method: "POST", body: { cluster: g.cluster, name, kind: !animal && pet.checked ? "pet" : undefined } });
         toast(`Named ${r.name || name}${r.joined ? ` (and ${plural(r.joined, "similar group")})` : ""}. Looking for them in other photos…`);
         gone(card, r.joined || 0);
         if (r.joined) dropJoined(r.id);
@@ -584,11 +629,14 @@ export function mount(root, ctx) {
       h("a", { class: "faces4", href: lib(`cluster=${g.cluster}`), title: "Show these photos" },
         g.sample.map((fid) => h("img", { src: faceUrl(fid), alt: "", loading: "lazy" }))),
       h("div", { class: "row", style: { justifyContent: "space-between" } }, h("span", { class: "muted" }, plural(g.photos, "photo")),
-        h("label", { class: "check muted small" }, pet, h("span", {}, "pet"))),
+        animal ? null : h("label", { class: "check muted small" }, pet, h("span", {}, "pet"))),
       form, aliasHint(input),
-      h("div", { class: "row", style: { gap: "4px" } },
-        h("button", { class: "btn ghost small", title: "People you don't know: hidden from naming and coverage", onclick: () => ignore(g, "Strangers", card) }, "Strangers"),
-        h("button", { class: "btn ghost small", title: "Not a face (a statue, a print, a pattern)", onclick: () => ignore(g, "Not a face", card) }, "Not a face")));
+      animal ? h("div", { class: "row", style: { gap: "4px" } },
+        h("button", { class: "btn ghost small", title: "Someone else's pet, or a stray: hidden from naming", onclick: () => ignore(g, hideAs, card) }, "Not ours"),
+        h("button", { class: "btn ghost small", title: "Not a dog or cat (a toy, a statue, a pattern)", onclick: () => ignore(g, notAs, card) }, notAs))
+        : h("div", { class: "row", style: { gap: "4px" } },
+          h("button", { class: "btn ghost small", title: "People you don't know: hidden from naming and coverage", onclick: () => ignore(g, hideAs, card) }, "Strangers"),
+          h("button", { class: "btn ghost small", title: "Not a face (a statue, a print, a pattern)", onclick: () => ignore(g, notAs, card) }, notAs)));
     return card;
   }
 

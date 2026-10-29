@@ -9,7 +9,7 @@ import json
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from ... import identity, library, query as query_mod, scoring, smart, taste
-from ..deps import FILTER_KEYS, cap, conn_dep, filter_from, ids_of, one, require_writer, viewer_of
+from ..deps import FILTER_KEYS, cap, conn_dep, filter_for, filter_from, ids_of, one, require_writer, viewer_of
 from .library import browse_filter, hidden_by_browsing, settings_of
 
 router = APIRouter()
@@ -61,6 +61,18 @@ def _pool(conn, key: tuple, fresh: bool, rank, unlikely: bool, sort: str) -> tup
     return entry["pools"][(unlikely, sort)], entry["counts"]
 
 
+def picture_match_ids(conn, text: str) -> list[int]:
+    """Every photo a picture search for `text` matches, strongly or possibly, each frame of a burst
+    (none until the search index exists): what the Library shows for its `q`. Kept with the search's
+    pages, so the Library's pages, counts and Explore don't search again; a newer index searches again."""
+    srch = _search_mod(conn)
+    if not srch:
+        return []
+    key = (conn.execute("PRAGMA database_list").fetchone()[2], text, "library", srch.indexed_count(conn))
+    pool, _ = _pool(conn, key, False, lambda: srch.search(conn, text, 2 * RANKED_KEEP), False, "best")
+    return [h["id"] for h in pool]
+
+
 def _group_ids(conn, ids: list[int]) -> dict[int, int | None]:
     out: dict[int, int | None] = {}
     for k in range(0, len(ids), 500):
@@ -92,7 +104,7 @@ def api_search(p: str, request: Request, q: str = "", limit: int = 200, offset: 
     Library (offset, limit); ids_only gives every match's id (for "select all" and albums)."""
     parsed = query_mod.parse(q, conn, me=identity.person_id(conn, viewer_of(request)))
     params = {**dict(request.query_params), **{k: str(v) for k, v in parsed["filter"].items()}}
-    raw = filter_from(params, viewer_of(request))
+    raw = filter_from({k: v for k, v in params.items() if k != "q"}, viewer_of(request))
     flt = browse_filter(conn, dataclasses.replace(raw))
     filtered = any(k for k in parsed["filter"]) or any(k in request.query_params for k in ("status", "person", "event", "place", "album"))
     text = parsed["text"]
@@ -146,7 +158,13 @@ def api_search(p: str, request: Request, q: str = "", limit: int = 200, offset: 
     rows = {r["id"]: r for r in library.rows_by_ids(conn, [h["id"] for h in hits])}
     out = [rows[h["id"]] | {"score": h["score"], **({"similar_n": h["similar_n"]} if h.get("similar_n") else {})}
            for h in hits if h["id"] in rows]
-    return {"engine": "clip", "rows": out, "total": len(pool), **meta}
+    # How many photos the picture match can see (none, before an update has read them with CLIP: its
+    # table may not even be there yet).
+    indexed = one(conn, "SELECT COUNT(*) FROM embeddings e JOIN shots s ON s.id = e.shot_id WHERE s.status='present'"
+                        " AND e.model=? AND e.src = s.analyzed_fp", (ai.MODEL_TAG,)) \
+        if one(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embeddings'") else 0
+    return {"engine": "clip", "rows": out, "total": len(pool), "indexed": indexed,
+            "photos": one(conn, "SELECT COUNT(*) FROM shots WHERE status='present'"), **meta}
 
 
 @router.get("/api/p/{p}/query/parse")
@@ -237,7 +255,7 @@ def api_balance(p: str, request: Request, body: dict = Body(default_factory=dict
         target = 0
     if not 1 <= target <= 5000:
         raise HTTPException(400, "How many photos do you deliver? Set a target first.")
-    res = smart.balance(conn, target, filter_from(body.get("filter") or {}, viewer_of(request)))
+    res = smart.balance(conn, target, filter_for(conn, body.get("filter") or {}, viewer_of(request)))
     res["rows"] = library.rows_by_ids(conn, res["ids"])
     return res
 

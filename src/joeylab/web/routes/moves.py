@@ -24,7 +24,7 @@ import uuid
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from ... import db, dupes, library, locks, moves
-from ..deps import conn_dep, filter_from, ids_of, require_owner, viewer_of
+from ..deps import conn_dep, filter_for, ids_of, require_owner, viewer_of
 from .library import browse_filter
 from .trash import reindex
 
@@ -60,7 +60,7 @@ def _ids(conn, request: Request, body: dict) -> list[int]:
     if ids:
         return ids
     if body.get("filter") is not None:
-        flt = browse_filter(conn, filter_from(body.get("filter") or {}, viewer_of(request)))
+        flt = browse_filter(conn, filter_for(conn, body.get("filter") or {}, viewer_of(request)))
         return [r["id"] for r in library.shots(conn, flt)]
     raise HTTPException(400, "Say which photos: ids, or a filter.")
 
@@ -183,8 +183,14 @@ def api_move_back(p: str, oid: str, request: Request, body: dict = Body(default_
 def api_move_recover(p: str, request: Request, conn=Depends(conn_dep)):
     """Finish (or roll back) a move that stopped half way, from its log."""
     require_owner(request, "move or rename files")
+    stuck: list = []
     try:
         with locks.project_lock(p, wait=30):
-            return {"recovered": moves.recover(conn, p)}
+            done = moves.recover(conn, p, stuck)
     except locks.Busy as e:
         raise HTTPException(409, str(e))
+    if stuck:
+        s = stuck[0]
+        raise HTTPException(409, f"JoeyLab couldn't finish “{s['label'] or 'a move'}” from its log ({s['error']}). It's left "
+                                 "as it stopped; try again once whatever it needs (a drive, say) is back.")
+    return {"recovered": done}

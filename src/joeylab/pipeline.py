@@ -1,6 +1,6 @@
 """One update of a library, shared by the CLI and the web server: scan → analyse → stacks,
-duplicates and scores → faces → picture vectors → search → places, events and refined scores →
-the untouched check.
+duplicates and scores → faces → picture vectors → search and pets → places, events and refined
+scores → the untouched check.
 
 Progress goes through a Reporter so each front end can show it its own way.
 """
@@ -221,6 +221,29 @@ def run_faces(conn, rep: Reporter, enabled: bool = True, force: bool = False) ->
     return n
 
 
+def run_face_quality(conn, rep: Reporter, enabled: bool = True) -> int:
+    """How well each face is caught (Apple Vision's capture quality), judged once per face from its crop,
+    for scoring's faces part and Cull's face compare. A pass of its own, so faces found before it existed
+    are judged without being found again."""
+    from . import faces, search
+
+    if not enabled or not search.vision_available():
+        return 0
+    todo = len(faces.quality_pending(conn))
+    if not todo:
+        return 0
+    rep.step("faces")
+    rep.stage("Judging faces", todo)
+    errors: list = []
+    n = faces.measure_quality(conn, progress=lambda d, t: rep.advance(d, t), errors=errors)
+    left = len(faces.quality_pending(conn))
+    rep.log(f"Faces: judged how well {_n(n, 'face is', 'faces are')} caught" + (f"; {left:,} still to judge" if left else ""),
+            "warn" if left else "ok")
+    for sid, why in errors[:5]:
+        rep.log(f"Photo {sid}: {why}", "error")
+    return n
+
+
 def run_ai(conn, rep: Reporter, enabled: bool = True) -> int:
     from . import ai
 
@@ -289,10 +312,50 @@ def run_search_index(conn, rep: Reporter, enabled: bool = True) -> int:
     return n
 
 
+def run_pets(conn, rep: Reporter, enabled: bool = True) -> int:
+    """Dogs and cats (pets.py): Apple Vision on each photo's thumbnail, then the search model on each
+    animal it finds, for People to group and name them. A step of its own, with its own stamp: photos
+    indexed for search before are only looked at for animals. Then faces the face models found on an
+    animal, where nobody is, are set aside from people's (quick: only photos with an animal)."""
+    from . import pets, search
+
+    if not enabled or not pets.available():
+        return 0
+    todo = len(pets.pending(conn))
+    n = 0
+    if todo:
+        rep.step("search")
+        rep.stage("Loading the search model")
+        try:
+            search.Model.get()
+        except (config.ModelMissing, OSError) as e:
+            rep.log(f"Pets: not looked for. {e}", "warn")
+            todo = 0
+    if todo:
+        rep.stage("Looking for pets", todo)
+        errors: list = []
+        try:
+            n = pets.run(conn, progress=lambda d, t: rep.advance(d, t), errors=errors)
+        except search.GpuStuck as e:
+            rep.log(f"Pets: stopped. {e}; the other photos are looked at in the next update, on the CPU", "warn")
+            n = todo - len(pets.pending(conn))
+        else:
+            left = len(pets.pending(conn))
+            rep.log(f"Pets: looked at {_n(n, 'photo')}; {_n(pets.counts(conn)['pets'], 'dog or cat', 'dogs and cats')}"
+                    " in the library so far" + (f"; {left:,} photos still to look at" if left else ""), "warn" if left else "ok")
+            for sid, why in errors[:5]:
+                rep.log(f"Photo {sid}: {why}", "error")
+    moved = pets.animal_faces(conn)
+    if moved:
+        rep.log(f"People: {_n(moved, 'face')} on a dog or cat, with no one there, set aside from people's faces"
+                " (People › Name faces › Animals' faces)", "ok")
+    return n
+
+
 def refine(conn, rep: Reporter, regroup: bool = True) -> dict:
     """After faces, picture vectors and search: people, taste, places and events, then the stacks
     (when there are new picture vectors) and scores again with what those add."""
-    from . import events, faces, geo, taste
+    from . import events, faces, geo, pets, taste
 
     rep.step("places")
     rep.stage("Finding places and events")
@@ -301,6 +364,9 @@ def refine(conn, rep: Reporter, regroup: bool = True) -> dict:
         fc = faces.cluster(conn)
         if fc["faces"]:
             rep.log(f"People: {_n(fc['faces'], 'face')} in {_n(fc['clusters'], 'group')}", "ok")
+    pc = pets.cluster(conn)
+    if pc["groups"]:
+        rep.log(f"Pets: {_n(pc['pets'], 'dog or cat', 'dogs and cats')} in {_n(pc['groups'], 'group')}", "ok")
     t = taste.train_all()
     if t.get("auc") is not None:
         rep.log(f"Taste: learned from {_n(t['positives'], 'keeper')} and {_n(t['negatives'], 'reject')} "
@@ -316,6 +382,9 @@ def refine(conn, rep: Reporter, regroup: bool = True) -> dict:
         rep.log(f"Stacks: {_n(g['groups'], 'stack')} ({g['multi_frame_groups']:,} with more than one frame), "
                 "now with scene similarity", "ok")
     out["score"] = scoring.run(conn)
+    from . import db
+
+    db.refresh_stats(conn)               # the photo tables' statistics in full, when the photo count has moved
     conn.execute("PRAGMA optimize")      # keeps the query planner's statistics current as the library grows
     return out
 
@@ -343,11 +412,17 @@ def _work_left(conn, project: str, faces_on: bool, ai_on: bool) -> bool:
     if (faces_on and faces.available() and faces.enabled() and db.get_setting(conn, "faces_enabled", True)
             and faces.pending(conn)):
         return True
+    if faces_on and conn.execute("SELECT 1 FROM faces f INDEXED BY faces_unjudged JOIN shots s ON s.id = f.shot_id"
+                                 " WHERE f.quality IS NULL AND s.status = 'present' LIMIT 1").fetchone():
+        from . import search
+
+        if search.vision_available():
+            return True
     if ai_on and ai.available() and ai.pending(conn):
         return True
-    from . import search
+    from . import pets, search
 
-    return bool(ai_on and search.available() and search.pending(conn))
+    return bool(ai_on and search.available() and (search.pending(conn) or (pets.available() and pets.pending(conn))))
 
 
 def run_all(conn, project: str, rep: Reporter, *, do_scan: bool = True, only_if_changed: bool = False,
@@ -386,10 +461,12 @@ def _run_all(conn, project, rep, *, do_scan, only_if_changed, force, faces, ai_l
     rep.finished("group")
     summary["colours"] = measure_colours(conn, rep)
     summary["faces"] = run_faces(conn, rep, faces, force=force)
+    summary["face_quality"] = run_face_quality(conn, rep, faces)
     rep.finished("faces")
     summary["embedded"] = run_ai(conn, rep, ai_layer)
     rep.finished("ai")
     summary["search_indexed"] = run_search_index(conn, rep, ai_layer)
+    summary["pets"] = run_pets(conn, rep, ai_layer)
     rep.finished("search")
     later = refine(conn, rep, regroup=bool(summary["embedded"]))
     summary["groups"] = later.get("groups", summary["groups"])

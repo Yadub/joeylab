@@ -7,11 +7,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
-from ... import history, library
+from ... import history, library, locks
 from ..deps import cap, conn_dep, require_owner
 
 
 router = APIRouter()
+PUT_BACK_WAIT_S = 60          # Put Back answers the request itself, so it waits only so long for an update
 
 
 def _day(v: str | None, end: bool = False) -> float | None:
@@ -46,7 +47,8 @@ def api_trash_moves(p: str, request: Request):
 @router.post("/api/p/{p}/history/putback")
 def api_put_back(p: str, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
     """Put files from one Trash log back where they were: {log, paths?} (all still in the Trash when
-    no paths are given). Only what JoeyLab moved, only to where it was, never over anything."""
+    no paths are given). Only what JoeyLab moved, only to where it was, never over anything. Waits a
+    little for an update of the library to finish (a scan must never see it half done)."""
     require_owner(request, "put files back from its Trash")
     from ...cleanup import Busy
 
@@ -54,8 +56,8 @@ def api_put_back(p: str, request: Request, body: dict = Body(default_factory=dic
     if paths is not None and (not isinstance(paths, list) or not all(isinstance(x, str) for x in paths)):
         raise HTTPException(400, "paths is a list of the files' original places.")
     try:
-        return history.put_back(conn, p, str(body.get("log") or ""), paths)
+        return history.put_back(conn, p, str(body.get("log") or ""), paths, wait=PUT_BACK_WAIT_S)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    except Busy as e:
+    except (Busy, locks.Busy) as e:
         raise HTTPException(409, str(e))

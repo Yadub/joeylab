@@ -99,8 +99,8 @@ export function exploreView({ project, by: first, asked = false, filter: firstFi
     selectAll: () => { for (const i of shownIndices()) sel.add(S.ids[i]); paintSel(); },
   };
   const bar = selectionBar(grid, { changed: () => changed?.() });
-  bar.insertBefore(h("button", { type: "button", class: "btn ghost small", title: "List these photos in the Library's grid",
-    onclick: showInLibrary }, "Show in Library"), bar.lastElementChild);
+  bar.addGroup(h("button", { type: "button", class: "btn ghost small", title: "List these photos in the Library's grid",
+    onclick: showInLibrary }, "Show in Library"));
   el.append(bar);
   function paintSel() { for (const fn of selListeners) fn(); schedule(); }
 
@@ -263,7 +263,8 @@ export function exploreView({ project, by: first, asked = false, filter: firstFi
       const r = wheel.r + 1;
       return { x0: wheel.cx - r, y0: wheel.cy - r, x1: wheel.cx + r, y1: wheel.cy + r };
     }
-    if (S.L?.guides?.lines && (!any || shownCount() === S.n)) return { x0: 0, y0: 0, x1: S.cols, y1: S.rows };
+    // (The time lines and the cameras' islands have their names above the photos: those too.)
+    if ((S.L?.guides?.lines || S.L?.guides?.islands) && (!any || shownCount() === S.n)) return { x0: 0, y0: 0, x1: S.cols, y1: S.rows };
     return { x0, y0, x1, y1 };
   }
   let fitted = null;                     // fitView(), until the layout, the filters or the size change
@@ -679,10 +680,17 @@ export function exploreView({ project, by: first, asked = false, filter: firstFi
     if (g.x) axes(g);
     if (g.lines) timeLabels(g);
     if (g.islands) {
+      // No name covers a photo: each island's photos count as taken (from just under its name).
+      const photos = g.islands.map(([x, y, w, hh]) => [X(x), Y(y + 2) + 4, w * s, (hh - 2) * s - 4]);
       const items = g.islands.slice().sort((a, b) => b[5] - a[5]).map(([x, y, w, hh, name, k]) =>
         ({ text: `${name} · ${n(k)}`, x: X(x), y: Y(y + 1.6), opts: { size: s >= 6 ? "--fs-ui" : "--fs-sm", weight: 600, pill: false, align: "left", base: "bottom" } }));
-      const taken = placeAll(items);
-      if (s >= 7) placeAll(g.lenses.slice().sort((a, b) => b[3] - a[3]).map(([x, y, name, k]) => ({ text: `${name} · ${n(k)}`, x: X(x) + 2, y: Y(y) + 2, opts: { size: "--fs-xs", align: "left", base: "top" } })), taken);
+      const taken = placeAll(items, photos);
+      // Where each lens (or camera) starts: beside its island, at the row it starts on.
+      const islandAt = (x, y) => g.islands.find(([ix, iy, w, hh]) => x >= ix && x < ix + w && y >= iy && y < iy + hh);
+      if (s >= 7) placeAll(g.lenses.slice().sort((a, b) => b[3] - a[3]).map(([x, y, name, k]) => {
+        const [ix, , w] = islandAt(x, y) || [x, 0, 0];
+        return { text: `${name} · ${n(k)}`, x: X(ix + w) + 6, y: Y(y + 0.5), opts: { size: "--fs-xs", align: "left", pill: false, ink: "--muted" } };
+      }), taken);
     }
     ctx.globalAlpha = 1;
   }

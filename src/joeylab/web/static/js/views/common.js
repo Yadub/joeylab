@@ -4,10 +4,11 @@
 import { api, img, P } from "../api.js";
 import { loupeOpen, openLoupe } from "../loupe.js";
 import { addToAlbum, removeFromAlbum } from "./albumpick.js";
+import { keysDialog } from "./keys.js";
 import { bulkKeywordDialog, keywordDialog } from "./keywords.js";
 import { canMove, fileActions } from "./moves.js";
-import { acceptSuggestions, clearDecision, decide, emit, remember, row, setLabel, setPick, store, toggleFav, undo } from "../store.js";
-import { agree, choiceSeg, clear, dialog, h, holdFocus, icon, LABEL_COLORS, n, plural, starsEl, toast } from "../ui.js";
+import { acceptSuggestions, clearDecision, decide, emit, redo, remember, row, setLabel, setPick, store, toggleFav, undo } from "../store.js";
+import { agree, choiceSeg, clear, closePopover, dialog, h, holdFocus, icon, LABEL_COLORS, n, plural, popover, starsEl, toast } from "../ui.js";
 
 const LABEL_KEYS = { 6: "Red", 7: "Yellow", 8: "Green", 9: "Blue" };
 
@@ -113,8 +114,9 @@ export function selectionBar(grid, { filter, stacked = () => false, album = () =
   const ACCEPT_TIP = "Accept suggestions (A)";
   const ACCEPT_ALL_TIP = "Suggestions are accepted for the photos loaded so far: select those instead of everything matching";
   const acceptBtn = h("button", { class: "btn ghost small", title: ACCEPT_TIP, onclick: accept }, icon("sparkle"), "Accept");
+  const albumLbl = h("span", {}, "Add to album");
   const albumBtn = h("button", { class: "btn ghost small", title: "Add to an album (B)", "aria-haspopup": "listbox", onclick: () => toAlbum() },
-    icon("album"), "Add to album", h("span", { class: "caret", "aria-hidden": "true" }, "▸"));
+    icon("album"), albumLbl, h("span", { class: "caret", "aria-hidden": "true" }, "▸"));
   const outBtn = h("button", { class: "btn ghost small", hidden: true, title: "Take these out of this album (the photos stay in the library)",
     onclick: outOfAlbum }, "Remove from album");
   const dateBtn = h("button", { class: "btn ghost small", title: "Shift these photos' times (a camera whose clock was wrong), or date photos that have none",
@@ -125,27 +127,52 @@ export function selectionBar(grid, { filter, stacked = () => false, album = () =
     } }, icon("calendar"), "Date…");
   const moveBtn = canMove() ? h("button", { class: "btn ghost small", title: "Move these photos to another folder, or rename their files, on disk",
     "aria-haspopup": "menu", onclick: () => onDisk() }, icon("folder"), "Move…") : null;
-  const bar = h("div", { class: "selbar", hidden: true, role: "toolbar", "aria-label": "Selected photos" },
-    n, widen,
-    ...[1, 2, 3, 4, 5].map((s) => h("button", { class: "btn ghost small", title: `${s} stars (${s})`,
-      onclick: () => decideSel(keyChange(String(s))) }, icon("star"), s)),
-    h("span", { class: "sep" }),
-    h("button", { class: "btn small", title: "Pick (P)", onclick: () => decideSel(keyChange("p")) }, icon("pick"), "Pick"),
-    h("button", { class: "btn small", title: "Reject (X)", onclick: () => decideSel(keyChange("x")) }, icon("reject"), "Reject"),
-    h("button", { class: "btn ghost small icon-only", title: "Favourite (F)", "aria-label": "Favourite", onclick: fav }, icon("heart")),
-    h("span", { class: "label-pick" }, Object.entries(LABEL_COLORS).map(([name, c]) => h("button", {
-      type: "button", class: "label-dot", style: { background: c }, title: `${name} label`, "aria-label": `${name} label`,
-      onclick: () => decideSel({ change: { label: name }, what: `${name} label`, toggle: true }) }))),
-    h("button", { class: "btn ghost small", title: "Remove stars, pick/reject and label",
-      onclick: () => decideSel({ change: { rating: 0, pick: 0, label: "" }, what: "clear" }) }, "Clear"),
-    acceptBtn,
-    h("button", { class: "btn ghost small", title: "Add or remove keywords (T)", onclick: keyword }, "Keyword…"),
-    h("span", { class: "sep" }),
-    h("button", { class: "btn ghost small", title: "Compare side by side (C)", onclick: () => compareDialog(target().slice(0, 6)) }, icon("compare"), "Compare"),
-    albumBtn, outBtn, dateBtn, moveBtn,
-    h("button", { class: "btn ghost small", title: "Teach JoeyLab what these have in common", onclick: () => conceptDialog(target()) }, icon("wand"), "Teach…"),
-    h("button", { class: "btn ghost small icon-only", title: "Deselect (Esc)", "aria-label": "Deselect", onclick: () => grid.clearSelection() }, icon("close")),
-  );
+  const stars = [1, 2, 3, 4, 5].map((s) => h("button", { class: "btn ghost small", title: `${s} stars (${s})`,
+    onclick: () => decideSel(keyChange(String(s))) }, icon("star"), s));
+  // On a phone the five star buttons are one menu.
+  const starsBtn = h("button", { class: "btn ghost small", title: "Stars (1–5)", "aria-haspopup": "menu", onclick: (e) => {
+    const item = (label, d) => h("button", { type: "button", class: "menu-item", role: "menuitem", onclick: () => { closePopover(); decideSel(d); } }, label);
+    popover(e.currentTarget, [...[1, 2, 3, 4, 5].map((s) => item(h("span", { "aria-label": plural(s, "star") }, "★".repeat(s)), keyChange(String(s)))),
+      item("No stars", { change: { rating: 0 }, what: "no stars" })], { label: "Stars" });
+  } }, icon("star"), "Stars");
+  const pickBtn = h("button", { class: "btn small", title: "Pick (P)", onclick: () => decideSel(keyChange("p")) }, icon("pick"), "Pick");
+  const rejectBtn = h("button", { class: "btn small", title: "Reject (X)", onclick: () => decideSel(keyChange("x")) }, icon("reject"), "Reject");
+  const favBtn = h("button", { class: "btn ghost small icon-only", title: "Favourite (F)", "aria-label": "Favourite", onclick: fav }, icon("heart"));
+  const labels = h("span", { class: "label-pick" }, Object.entries(LABEL_COLORS).map(([name, c]) => h("button", {
+    type: "button", class: "label-dot", style: { background: c }, title: `${name} label`, "aria-label": `${name} label`,
+    onclick: () => decideSel({ change: { label: name }, what: `${name} label`, toggle: true }) })));
+  const clearBtn = h("button", { class: "btn ghost small", title: "Remove stars, pick/reject and label",
+    onclick: () => decideSel({ change: { rating: 0, pick: 0, label: "" }, what: "clear" }) }, "Clear");
+  const keywordBtn = h("button", { class: "btn ghost small", title: "Add or remove keywords (T)", onclick: keyword }, icon("tag"), "Keyword…");
+  const compareBtn = h("button", { class: "btn ghost small", title: "Compare side by side (C)", onclick: () => compareDialog(target().slice(0, 6)) }, icon("compare"), "Compare");
+  const teachBtn = h("button", { class: "btn ghost small", title: "Teach JoeyLab what these have in common", onclick: () => conceptDialog(target()) }, icon("wand"), "Teach…");
+  const deselect = h("button", { class: "btn ghost small icon-only", title: "Deselect (Esc)", "aria-label": "Deselect", onclick: () => grid.clearSelection() }, icon("close"));
+  const sep = () => h("span", { class: "sep" });
+  const extras = [];              // groups other views add (the RAW actions), before Deselect
+  const bar = h("div", { class: "selbar", hidden: true, role: "toolbar", "aria-label": "Selected photos" });
+  // Wide: the stars first, as the keys go. Narrow (a phone): what's left of the photos to decide is
+  // Pick, Reject, Album and Keyword, so they come first under the count and Deselect; the rest scrolls.
+  const narrow = window.matchMedia("(max-width: 900px)");
+  function arrange() {
+    const had = bar.contains(document.activeElement) ? document.activeElement : null;
+    bar.classList.toggle("compact", narrow.matches);
+    albumLbl.textContent = narrow.matches ? "Album" : "Add to album";
+    if (narrow.matches) {
+      clear(bar).append(h("div", { class: "selbar-head" }, n, widen, h("span", { class: "spacer" }), deselect),
+        h("div", { class: "selbar-acts" }, pickBtn, rejectBtn, albumBtn, keywordBtn, starsBtn, favBtn, labels, clearBtn, acceptBtn,
+          compareBtn, outBtn, dateBtn, moveBtn, teachBtn, ...extras));
+    } else {
+      clear(bar).append(n, widen, ...stars, sep(), pickBtn, rejectBtn, favBtn, labels, clearBtn, acceptBtn, keywordBtn, sep(),
+        compareBtn, albumBtn, outBtn, dateBtn, moveBtn, teachBtn, ...extras, deselect);
+    }
+    if (had && bar.contains(had)) had.focus({ preventScroll: true });
+  }
+  const onMedia = () => { if (bar.isConnected) arrange(); else narrow.removeEventListener("change", onMedia); };
+  narrow.addEventListener("change", onMedia);
+  arrange();
+  bar.addGroup = (el) => { extras.push(el); arrange(); };
+  // On touch a long press selects one photo: the bar shows from that one, with Deselect to leave.
+  const touch = window.matchMedia("(pointer: coarse)");
 
   const resolve = async () => filter();
   // Stacks selected: how many photos they hold, and whether any holds more than its one frame.
@@ -154,7 +181,7 @@ export function selectionBar(grid, { filter, stacked = () => false, album = () =
   function paint() {
     const g = grid;
     if (g.matchAll && g.sel.size < g.ids.length) g.matchAll = false;      // they deselected something
-    bar.hidden = g.sel.size < 2;
+    bar.hidden = g.sel.size < (touch.matches ? 1 : 2);
     if (bar.hidden) return;
     // Accepting suggestions works on loaded photos only, so it's off (and says why) for "all matching".
     acceptBtn.disabled = !!all();
@@ -377,7 +404,8 @@ export function dateDialog({ ids, filter, count, onDone, undated = false }) {
   show();
 }
 
-/** Save photos as a JoeyLab album (in the catalog), or as a folder of links/copies on disk. */
+/** Save photos as a JoeyLab album (in the catalog), or as a folder of links/copies on disk: ids, or
+ * everything matching a filter (counted first, so the dialog says how many it saves). */
 export function albumDialog({ ids, filter, name }) {
   const base = store.meta?.home ? `${store.meta.home}/Pictures/JoeyLab` : "~/Pictures/JoeyLab";
   const albumName = h("input", { class: "input", id: "album-name", value: name || "", placeholder: "Album name", required: true });
@@ -403,9 +431,11 @@ export function albumDialog({ ids, filter, name }) {
   albumName.addEventListener("input", () => { dest.value = `${base}/${albumName.value.replace(/[/:]/g, "-") || "Album"}`; });
   dest.value = `${base}/${(name || store.project + "-album").replace(/[/:]/g, "-")}`;
   const out = h("div", { class: "result", hidden: true });
-  const count = ids ? plural(ids.length, "photo") : "the photos matching your filter";
-  dialog("Save as album", h("div", { class: "stack-v" },
-    h("p", { class: "note" }, `${count[0].toUpperCase()}${count.slice(1)}. Your originals stay where they are.`),
+  // No filter at all: every photo in the library.
+  const everything = !ids && !Object.entries(filter || {}).some(([k, v]) => k !== "all" && v !== "" && v != null);
+  const note = h("p", { class: "note" });
+  const dlg = dialog("Save as album", h("div", { class: "stack-v" },
+    note,
     h("label", { class: "field" }, h("span", {}, "Name"), albumName),
     where, folderBox, out,
   ), [
@@ -428,6 +458,16 @@ export function albumDialog({ ids, filter, name }) {
       }
     } },
   ]);
+  // How many it saves: "All 24 photos matching your filter", and "Save all 24 as album".
+  const say = (k) => {
+    const what = ids ? plural(k, "photo") : everything ? `Every photo in the library${k != null ? ` (${n(k)})` : ""}`
+      : k != null ? `All ${plural(k, "photo")} matching your filter` : "The photos matching your filter";
+    note.textContent = `${what}. Your originals stay where they are.`;
+    const save = dlg.querySelector('button[type="submit"]');
+    if (save) save.textContent = k > 1 ? `Save all ${n(k)} as album` : "Save album";
+  };
+  say(ids ? ids.length : null);
+  if (!ids) api(P(store.project, "/bulk"), { method: "POST", body: { filter: filter || {}, count_only: true } }).then((r) => say(r.n)).catch(() => {});
 }
 
 /** Teach a personal concept ("my blue bike") from a few examples. */
@@ -477,8 +517,9 @@ export async function compareDialog(ids) {
   }
   const keepBtn = h("button", { class: "btn primary", onclick: async () => {
     const keep = ids[focus];
-    await decide(ids.map((id) => (id === keep ? { id, pick: 1 } : { id, pick: -1 })), "keep the best of a comparison");
+    const res = await decide(ids.map((id) => (id === keep ? { id, pick: 1 } : { id, pick: -1 })), "keep the best of a comparison");
     close();
+    if (res) toast(`Kept ${row(keep)?.stem || "one"}, rejected ${plural(ids.length - 1, "other")}`, { key: "decision", action: () => undo(res.batch) });
   } }, icon("keep"), "Keep the highlighted one, reject the others");
   let release = () => {};
   const close = () => {
@@ -491,8 +532,14 @@ export async function compareDialog(ids) {
   closeCompare.current?.();
   closeCompare.current = close;
   const onKey = (e) => {
-    if (loupeOpen()) return;              // a photo opened from here has the keys until it closes
+    if (loupeOpen() || document.querySelector("dialog[open]")) return;    // a photo opened from here, or the shortcuts, have the keys
     const k = e.key;
+    const cmd = e.metaKey || e.ctrlKey;
+    // Undo and Redo work here as everywhere (the page behind hears no keys while this is open).
+    if ((k === "u" && !cmd) || (cmd && k.toLowerCase() === "z" && !e.shiftKey)) { e.preventDefault(); e.stopPropagation(); undo().then(paint); return; }
+    if ((k === "U" && !cmd) || (cmd && k.toLowerCase() === "z" && e.shiftKey)) { e.preventDefault(); e.stopPropagation(); redo().then(paint); return; }
+    if (cmd || e.altKey) return;
+    if (k === "?") { e.preventDefault(); e.stopPropagation(); keysDialog({ name: "Compare" }); return; }      // (its keys first)
     if (k === "Escape") { close(); }
     else if (/^[1-6]$/.test(k) && +k <= ids.length) { focus = +k - 1; paint(); }
     else if (k === "ArrowRight") { focus = Math.min(ids.length - 1, focus + 1); paint(); }
@@ -516,7 +563,7 @@ export async function compareDialog(ids) {
 }
 
 // The shortcuts dialog lives in keys.js (by page, the current one first; gestures on a phone).
-export { keysDialog } from "./keys.js";
+export { keysDialog };
 
 /** How strictly frames are stacked: a 1-5 slider that shows, while you drag, what each level would give,
  * and restacks when you let go. `onApplied` runs once the new stacks are in. */

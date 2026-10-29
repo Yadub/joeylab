@@ -162,12 +162,17 @@ def _set(conn, sid: int, ids: list[int], src: str) -> None:
 
 def assign(conn, shot_ids: list[int], add: list[int] = (), remove: list[int] = (), what: str = "keywords",
            source: str = "web", viewer: str | None = None, batch: str | None = None) -> tuple[str, list[int]]:
-    """Add and remove keywords on photos as one undoable step in the history. Returns (batch, changed ids)."""
+    """Add and remove keywords on photos as one undoable step in the history. Each photo's keywords are
+    read under the write lock, so two changes at once both count. Returns (batch, changed ids)."""
+    from . import db
+
     batch = batch or uuid.uuid4().hex[:12]
     now = time.time()
     add, remove = [int(k) for k in add], set(int(k) for k in remove)
+    ids = list(dict.fromkeys(int(s) for s in shot_ids))
+    db.write_lock(conn)                   # what each photo has, the change and the log, as one
     changed = []
-    for sid in dict.fromkeys(int(s) for s in shot_ids):
+    for sid in ids:
         before = _ids_of(conn, sid)
         after = sorted((set(before) | set(add)) - remove)
         if after == before:

@@ -11,8 +11,10 @@ Files whose copy stays go by default; files that are the last copy go only when 
 
 Moves use macOS's own Trash (Finder's "Put Back" works). On an external drive the Trash lives on
 that drive, so the space comes back when you empty the Trash. Each run writes a log to
-~/.joeylab/trash-log. The catalog marks each file missing as it goes, as the next scan would, so
-the app shows it gone at once; put back, it's found again by the next scan.
+~/.joeylab/trash-log as it goes: a row for each file as soon as it's dealt with, with what it was
+(size, modified time, inode), so a run cut short still has an exact log and Put Back knows the file
+again. The catalog marks each file missing as it goes, as the next scan would, so the app shows it
+gone at once; put back, it's found again by the next scan.
 """
 
 from __future__ import annotations
@@ -38,6 +40,9 @@ SYSTEM_DIRS = {".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems", "
 IDENTICAL, RESAVED, TWIN, LAST, SKIP = "identical", "resaved", "twin", "last", "skip"
 SIDECAR = "sidecar"                   # a RAW's own .xmp, moved with it (raws.py)
 HAS_COPY = (IDENTICAL, RESAVED)
+MOVED = "moved to the Trash"
+STOPPED = "left alone: the run stopped before it got to it"
+STOPPED_MOVING = "the run stopped while it was being moved (look in the Trash)"
 DESCRIBE = {
     IDENTICAL: "an identical copy stays on this drive (checked byte for byte)",
     RESAVED: "a re-saved copy of the same photo stays on this drive",
@@ -56,12 +61,33 @@ class Item:
     mtime_ns: int = 0
     stays: str | None = None          # the copy (or twin) that stays
     stays_size: int | None = None
+    stays_ident: tuple | None = None  # the copy that stays as checked: (device, inode, size, modified)
     shot_id: int | None = None
     ident: tuple | None = None        # (device, inode): the file itself, however its path is spelled
     why: str = ""
     result: str = ""
     trashed_to: str | None = None
+    moved: tuple | None = None        # what went to the Trash: (device, inode, size, modified), for Put Back
     photo_gone: bool = False          # moved, and none of its photo's files is left: the photo is missing
+
+
+def real_ino(ino) -> bool:
+    """An inode number the drive keeps for the file. Some drives make them up (exFAT under macOS's
+    FSKit numbers files down from 2^64, and may number them again), so those are never compared."""
+    return ino is not None and 0 < int(ino) < 2**63
+
+
+def ident_of(st: os.stat_result) -> tuple:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def same_file(st: os.stat_result, was: tuple) -> bool:
+    """Whether st is still the file recorded as `was` (device, inode, size, modified): the same size
+    and modified time, and the same inode where the drive keeps real ones."""
+    dev, ino, size, mtime_ns = was
+    if (st.st_size, st.st_mtime_ns) != (size, mtime_ns):
+        return False
+    return not real_ino(ino) or (st.st_dev, st.st_ino) == (dev, ino)
 
 
 def _is_clutter(name: str) -> bool:
@@ -135,16 +161,22 @@ def plan(conn, paths: list[str], progress: Callable[[int, int], None] | None = N
     return items
 
 
-def _present(path: str, not_ident: tuple | None = None) -> int | None:
-    """The size of a regular file at this path, or None. With not_ident, a path that is really that
-    same file (another spelling of it) counts as absent: a file is never its own copy."""
+def _stat_of(path: str, not_ident: tuple | None = None) -> os.stat_result | None:
+    """A regular file at this path, or None. With not_ident, a path that is really that same file
+    (another spelling of it) counts as absent: a file is never its own copy."""
     try:
         st = os.lstat(path)
     except OSError:
         return None
     if not stat.S_ISREG(st.st_mode) or (not_ident and (st.st_dev, st.st_ino) == not_ident):
         return None
-    return st.st_size
+    return st
+
+
+def _keeps(it: Item, st: os.stat_result | None) -> None:
+    """The copy that stays, as found by the check."""
+    it.stays_size = st.st_size if st else None
+    it.stays_ident = ident_of(st) if st else None
 
 
 def _what_stays(conn, it: Item, r, listed: set[int], h, drives: dict | None = None) -> None:
@@ -157,9 +189,10 @@ def _what_stays(conn, it: Item, r, listed: set[int], h, drives: dict | None = No
                                           (r["fp"], r["id"])):
         if cid in listed or drives.get(croot) != here:
             continue
-        size = _present(cpath, it.ident)
-        if size == it.size and h(cpath) == h(it.path):
-            it.category, it.stays, it.stays_size = IDENTICAL, cpath, size
+        st = _stat_of(cpath, it.ident)
+        if st and st.st_size == it.size and h(cpath) == h(it.path):
+            it.category, it.stays = IDENTICAL, cpath
+            _keeps(it, st)
             return
     # 2. A re-saved copy of the same photo (same picture, saved again at another quality).
     for (cpath,) in conn.execute(
@@ -168,9 +201,10 @@ def _what_stays(conn, it: Item, r, listed: set[int], h, drives: dict | None = No
             " WHERE dm.file_id = ? AND f2.status = 'present'", (r["id"],)):
         if conn.execute("SELECT id FROM files WHERE path=?", (cpath,)).fetchone()[0] in listed:
             continue
-        size = _present(cpath, it.ident)
-        if size:
-            it.category, it.stays, it.stays_size = RESAVED, cpath, size
+        st = _stat_of(cpath, it.ident)
+        if st and st.st_size:
+            it.category, it.stays = RESAVED, cpath
+            _keeps(it, st)
             return
     # 3. The photo's other file (its RAW for a JPEG, or the other way round).
     if r["shot_id"] is not None:
@@ -178,9 +212,10 @@ def _what_stays(conn, it: Item, r, listed: set[int], h, drives: dict | None = No
                                        (r["shot_id"], r["id"])):
             if cid in listed:
                 continue
-            size = _present(cpath, it.ident)
-            if size:
-                it.category, it.stays, it.stays_size = TWIN, cpath, size
+            st = _stat_of(cpath, it.ident)
+            if st and st.st_size:
+                it.category, it.stays = TWIN, cpath
+                _keeps(it, st)
                 return
     it.category = LAST
 
@@ -265,27 +300,60 @@ def trash_files(items: list[Item], go: list[Item], log_name: str, mover: Callabl
     """Move the confirmed files (`go`, a part of the planned `items`) to the Trash, each checked again
     just before (and, with still_wanted, asked whether it should still go: a reason means no). One
     run at a time, across the app and the command line. Every planned file goes in the log, moved or
-    not. Returns the log's path."""
+    not, each as soon as it's dealt with. Returns the log's path."""
     mover = mover or move_to_trash
     chosen_ids = {id(i) for i in go}
     for it in items:
         if id(it) not in chosen_ids:
             it.result = f"left alone: {it.why}" if it.category == SKIP else "left alone: no copy stays (not asked to include last copies)"
-    with trash_lock():
-        _move_files(go, mover, still_wanted, on_moved=(lambda it: mark_moved(conn, it)) if conn is not None else None)
+    try:
+        with trash_lock(), TrashLog(log_name) as log:
+            for it in items:
+                if id(it) not in chosen_ids:
+                    log.file(it)
+            try:
+                _move_files(go, mover, still_wanted, log,
+                            after=(lambda it: mark_moved(conn, it) if it.result == MOVED else None) if conn is not None else None)
+            finally:
+                log.rest(go)
+    except BaseException:
+        if conn is not None and any(it.result == MOVED for it in go):     # stopped part way: the catalog still follows what went
+            try:
+                conn.rollback()
+                _settle(conn, go)
+            except Exception:
+                pass
+        raise
     if conn is not None:
-        # The copies that stay take over albums, keywords, favourites, comments and stars.
-        raise_to: dict = {}
-        for it in go:
-            if it.result == "moved to the Trash" and it.category in HAS_COPY and it.stays:
-                carry_over(conn, it.path, it.stays, raise_to)
-        conn.commit()
-        carry_decisions(conn, raise_to)
-        if any(it.result == "moved to the Trash" for it in go):
-            from .dupes import choose_shown
+        _settle(conn, go)
+    return str(log.path)
 
-            choose_shown(conn)          # a photo held on another drive too is shown from a copy that's still there
-    return _log(items, log_name)
+
+def _settle(conn, go: list[Item]) -> None:
+    """After a run (all of it, or as far as it got): every file moved is missing in the catalog, and
+    the copies that stay take over albums, keywords, favourites, comments and stars."""
+    moved = [it for it in go if it.result == MOVED]
+    if not moved:
+        return
+    mark_rest(conn, moved)
+    raise_to: dict = {}
+    for it in moved:
+        if it.category in HAS_COPY and it.stays:
+            carry_over(conn, it.path, it.stays, raise_to)
+    conn.commit()
+    carry_decisions(conn, raise_to)
+    from .dupes import choose_shown
+
+    choose_shown(conn)          # a photo held on another drive too is shown from a copy that's still there
+
+
+def mark_rest(conn, moved: list[Item]) -> None:
+    """Files moved that the catalog doesn't show gone yet (the run stopped between a move and its
+    catalog change) are marked now."""
+    for it in moved:
+        r = conn.execute("SELECT status FROM files WHERE path=?", (it.path,)).fetchone()
+        if r and r[0] == "present" and not os.path.lexists(it.path):
+            mark_moved(conn, it)
 
 
 def repair_from_logs(conn, project: str) -> dict:
@@ -298,7 +366,7 @@ def repair_from_logs(conn, project: str) -> dict:
     for log in sorted(glob.glob(str(config.HOME / "trash-log" / f"{project}-files-*.tsv"))):
         with open(log, encoding="utf-8") as fh:
             for row in csv.DictReader(fh, delimiter="\t"):
-                if row.get("result") == "moved to the Trash" and row.get("copy that stays") and \
+                if row.get("result") == MOVED and row.get("copy that stays") and \
                         not row.get("what stays", "").startswith("no copy stays"):
                     files += 1
                     carried += carry_over(conn, row["file"], row["copy that stays"], raise_to)
@@ -339,32 +407,51 @@ def mark_moved(conn, it: Item) -> None:
     conn.commit()
 
 
-def _move_files(go: list[Item], mover, still_wanted, on_moved: Callable[[Item], None] | None = None) -> None:
+def _move_files(go: list[Item], mover, still_wanted, log: "TrashLog", after: Callable[[Item], None] | None = None) -> None:
+    """Each file checked again and moved, its row in the log written at once; then after(it), moved or not."""
     for it in go:
-        if still_wanted:
-            reason = still_wanted(it)
-            if reason:
-                it.result = f"left alone: {reason}"
-                continue
-        try:
-            st = os.lstat(it.path)
-        except OSError:
-            it.result = "left alone: gone already"
-            continue
-        if st.st_size != it.size or st.st_mtime_ns != it.mtime_ns:
-            it.result = "left alone: changed since it was checked"
-            continue
-        if it.category in HAS_COPY + (TWIN,) and _present(it.stays, (st.st_dev, st.st_ino)) != it.stays_size:
+        _move_one(it, mover, still_wanted)
+        log.file(it)
+        if after:
+            after(it)
+
+
+def _move_one(it: Item, mover, still_wanted) -> None:
+    if still_wanted:
+        reason = still_wanted(it)
+        if reason:
+            it.result = f"left alone: {reason}"
+            return
+    try:
+        st = os.lstat(it.path)
+    except OSError:
+        it.result = "left alone: gone already"
+        return
+    if st.st_size != it.size or st.st_mtime_ns != it.mtime_ns:
+        it.result = "left alone: changed since it was checked"
+        return
+    if it.category in HAS_COPY + (TWIN,):
+        # The copy that stays must still be the very file checked: there, the same size, and not
+        # replaced since by another file of that name.
+        now = _stat_of(it.stays, (st.st_dev, st.st_ino))
+        if now is None or now.st_size != it.stays_size or (it.stays_ident and not same_file(now, it.stays_ident)):
             it.result = "left alone: the copy that should stay has changed or gone"
-            continue
-        try:
-            it.trashed_to = mover(it.path)
-            it.result = "moved to the Trash"
-        except OSError as e:
-            it.result = f"left alone: {e}"
-            continue
-        if on_moved:
-            on_moved(it)
+            return
+    trash_one(it, mover, st)
+
+
+def trash_one(it: Item, mover, st: os.stat_result) -> None:
+    """Move one checked file (st: as it was just before) and note what went, as it is in the Trash."""
+    try:
+        it.trashed_to = mover(it.path)
+    except OSError as e:
+        it.result = f"left alone: {e}"
+        return
+    it.result = MOVED
+    try:
+        it.moved = ident_of(os.lstat(it.trashed_to)) if it.trashed_to else ident_of(st)
+    except OSError:
+        it.moved = ident_of(st)
 
 
 # ---------------------------------------------------------------- empty folders
@@ -377,17 +464,38 @@ class EmptyFolder:
     result: str = ""
     trashed_to: str | None = None
     drive: str | None = None                            # the external drive it was found on (volume uuid)
+    moved: tuple | None = None                          # (device, inode) as it went to the Trash, for Put Back
 
 
-def folder_roots(conn) -> tuple[list[str], list[str]]:
+class Roots(list):
+    """Library folders to look in for empty folders, carrying the folders the library leaves out
+    (moved to another library): those, and everything in them, are never listed or moved."""
+
+    def __init__(self, paths=(), left_out=()):
+        super().__init__(paths)
+        self.left_out = [f.rstrip(os.sep) for f in left_out]
+
+
+def folder_roots(conn) -> tuple[Roots, list[str]]:
     """(the library folders to look in for empty folders, the ones held back). As before a scan,
     a renamed drive is followed, and a folder whose drive name now belongs to a different drive is
     held back: that drive's folders aren't the library's."""
-    from . import volumes
+    from . import db, volumes
 
     hold = volumes.check_roots(conn)["hold"]
     rows = conn.execute("SELECT id, path FROM roots ORDER BY path").fetchall()
-    return [r[1] for r in rows if r[0] not in hold], [r[1] for r in rows if r[0] in hold]
+    return Roots([r[1] for r in rows if r[0] not in hold], db.excluded_folders(conn)), [r[1] for r in rows if r[0] in hold]
+
+
+def _left_out(path: str, left_out: list[str]) -> str | None:
+    """Whether a folder belongs to another library: "in" (it is, or is inside, a folder moved
+    there), "holds" (one is inside it), or None."""
+    for f in left_out:
+        if path == f or path.startswith(f + os.sep):
+            return "in"
+    if any(f.startswith(path + os.sep) for f in left_out):
+        return "holds"
+    return None
 
 
 def _drive_of(path: str) -> str | None:
@@ -427,9 +535,11 @@ def _emptiness(path: str) -> tuple[bool, list[str], int]:
 
 def empty_folders(roots: list[str]) -> list[EmptyFolder]:
     """The top-most folders under these roots holding nothing but clutter (or nothing at all). The
-    roots themselves are never listed, nor anything the system keeps on a drive. Read-only. Take
-    the roots from folder_roots(), which leaves out folders on a different drive of the same name."""
+    roots themselves are never listed, nor anything the system keeps on a drive, nor a folder moved
+    to another library (or one holding one). Read-only. Take the roots from folder_roots(), which
+    leaves out folders on a different drive of the same name and knows the folders left out."""
     out: list[EmptyFolder] = []
+    left_out = getattr(roots, "left_out", [])
     for root in roots:
         if not os.path.isdir(root):
             continue
@@ -439,6 +549,12 @@ def empty_folders(roots: list[str]) -> list[EmptyFolder]:
             for d in sorted(dirnames):
                 full = os.path.join(dirpath, d)
                 if d in SYSTEM_DIRS or d.startswith(".") or os.path.islink(full):
+                    continue
+                where = _left_out(full, left_out)
+                if where == "in":
+                    continue                     # another library's: not looked at
+                if where == "holds":
+                    keep.append(d)               # never moved whole, but its other folders are looked at
                     continue
                 empty, clutter, folders = _emptiness(full)
                 if empty:
@@ -453,35 +569,50 @@ def trash_folders(folders: list[EmptyFolder], roots: list[str], log_name: str,
                   mover: Callable[[str], str | None] | None = None) -> str:
     mover = mover or move_to_trash
     roots_real = {os.path.realpath(r) for r in roots}
-    with trash_lock():
-        _move_folders(folders, roots_real, mover)
-    path = _log_path(log_name)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(["folder", "leftover files", "empty subfolders", "result", "now at"])
-        for f in folders:
-            w.writerow([f.path, len(f.clutter), f.folders, f.result, f.trashed_to or ""])
-    return str(path)
-
-
-def _move_folders(folders: list[EmptyFolder], roots_real: set[str], mover) -> None:
-    for f in folders:
-        real = os.path.realpath(f.path)
-        if real in roots_real or not any(real.startswith(r + os.sep) for r in roots_real):
-            f.result = "left alone: not inside a library folder"
-            continue
-        if _drive_of(f.path) != f.drive:                 # another drive under the same name since the check
-            f.result = "left alone: a different drive is there now"
-            continue
-        empty, clutter, _ = _emptiness(f.path)           # again, right before
-        if not empty:
-            f.result = "left alone: no longer empty"
-            continue
+    with trash_lock(), TrashLog(log_name, FOLDER_COLUMNS) as log:
         try:
-            f.trashed_to = mover(f.path)
-            f.result = "moved to the Trash"
-        except OSError as e:
-            f.result = f"left alone: {e}"
+            _move_folders(folders, roots_real, mover, log, getattr(roots, "left_out", []))
+        finally:
+            for f in folders:
+                if not f.result:
+                    f.result = STOPPED if os.path.lexists(f.path) else STOPPED_MOVING
+                    log.folder(f)
+    return str(log.path)
+
+
+def _move_folders(folders: list[EmptyFolder], roots_real: set[str], mover, log: "TrashLog", left_out: list[str] = ()) -> None:
+    for f in folders:
+        _move_folder(f, roots_real, mover, left_out)
+        log.folder(f)
+
+
+def _move_folder(f: EmptyFolder, roots_real: set[str], mover, left_out: list[str]) -> None:
+    real = os.path.realpath(f.path)
+    if real in roots_real or not any(real.startswith(r + os.sep) for r in roots_real):
+        f.result = "left alone: not inside a library folder"
+        return
+    if _left_out(f.path, left_out):
+        f.result = "left alone: it belongs to another library"
+        return
+    if _drive_of(f.path) != f.drive:                 # another drive under the same name since the check
+        f.result = "left alone: a different drive is there now"
+        return
+    empty, clutter, _ = _emptiness(f.path)           # again, right before
+    if not empty:
+        f.result = "left alone: no longer empty"
+        return
+    try:
+        st = os.lstat(f.path)
+        f.trashed_to = mover(f.path)
+        f.result = MOVED
+    except OSError as e:
+        f.result = f"left alone: {e}"
+        return
+    try:
+        now = os.lstat(f.trashed_to) if f.trashed_to else st
+    except OSError:
+        now = st
+    f.moved = (now.st_dev, now.st_ino)
 
 
 # ---------------------------------------------------------------- the Trash
@@ -545,27 +676,79 @@ def _trash_command(path: str) -> str | None:
 
 
 def _log_path(name: str):
+    """A new log file, made here and now: never one already there (two runs in one second get
+    name-<time>.tsv and name-<time>-2.tsv)."""
     d = config.HOME / "trash-log"
     d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.tsv"
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))      # what was moved, and from where: yours alone
-    return path
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    for k in range(1, 1000):
+        path = d / (f"{name}-{stamp}.tsv" if k == 1 else f"{name}-{stamp}-{k}.tsv")
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))   # what was moved, and from where: yours alone
+        except FileExistsError:
+            continue
+        return path
+    raise OSError(f"Couldn't start a new Trash log in {d}.")
 
 
-def _log(items: list[Item], name: str) -> str:
-    path = _log_path(name)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh, delimiter="\t")
-        w.writerow(["file", "what stays", "copy that stays", "bytes", "result", "now at"])
-        for it in items:
-            w.writerow([it.path, DESCRIBE[it.category], it.stays or "", it.size, it.result or it.why, it.trashed_to or ""])
-    return str(path)
+FILE_COLUMNS = ["file", "what stays", "copy that stays", "bytes", "result", "now at", "device", "inode", "modified ns"]
+FOLDER_COLUMNS = ["folder", "leftover files", "empty subfolders", "result", "now at", "device", "inode"]
+
+
+class TrashLog:
+    """A run's Trash log, written as it goes: started (a new file) before anything moves, then a row
+    for each file or folder as soon as it's dealt with, flushed to disk at once. A run cut short (the
+    catalog busy, Ctrl-C, the service stopped) leaves a log of exactly what went, so Put Back works.
+    What went is recorded as it is in the Trash: its device, inode and modified time (and size), so
+    Put Back can tell it from another file given the same name there later."""
+
+    def __init__(self, name: str, columns: list[str] = FILE_COLUMNS):
+        self.path = _log_path(name)
+        self._fh = open(self.path, "w", newline="", encoding="utf-8")
+        self._w = csv.writer(self._fh, delimiter="\t")
+        self._done: set[int] = set()
+        self._row(columns)
+
+    def __enter__(self) -> "TrashLog":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._fh.close()
+
+    def _row(self, row: list) -> None:
+        self._w.writerow(row)
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def file(self, it: Item) -> None:
+        dev, ino, _, mtime_ns = it.moved if it.result == MOVED and it.moved else ("", "", "", "")
+        self._done.add(id(it))
+        self._row([it.path, DESCRIBE[it.category], it.stays or "", it.size, it.result or it.why, it.trashed_to or "",
+                   dev, ino, mtime_ns])
+
+    def folder(self, f: EmptyFolder) -> None:
+        dev, ino = f.moved if f.result == MOVED and f.moved else ("", "")
+        self._row([f.path, len(f.clutter), f.folders, f.result, f.trashed_to or "", dev, ino])
+
+    def logged(self, it: Item) -> bool:
+        return id(it) in self._done
+
+    def rest(self, go: list[Item]) -> None:
+        """The files of the run not logged yet (it stopped before them), and their sidecars."""
+        for it in go:
+            if not self.logged(it):
+                it.result = it.result or (STOPPED if os.path.lexists(it.path) else STOPPED_MOVING)
+                self.file(it)
+            for s in getattr(it, "sidecars", ()):
+                if not self.logged(s):
+                    s.result = s.result or ("left alone: its RAW stayed" if it.result != MOVED else STOPPED)
+                    self.file(s)
 
 
 def emptied_by(items: list[Item]) -> list[str]:
     """Folders that the files just moved have left empty (for a hint to tidy them too)."""
     out = []
-    for d in sorted({os.path.dirname(i.path) for i in items if i.result == "moved to the Trash"}):
+    for d in sorted({os.path.dirname(i.path) for i in items if i.result == MOVED}):
         empty, _, _ = _emptiness(d)
         if empty:
             out.append(d)

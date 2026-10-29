@@ -442,6 +442,10 @@ def plan(conn, shot_ids: list[int] | None = None, progress: Callable[[int, int],
                 size, why_not = _rendition(o["path"], it.ident)
                 if size:
                     it.stays, it.stays_size = o["path"], size
+                    try:
+                        it.stays_ident = cleanup.ident_of(os.lstat(o["path"]))
+                    except OSError:
+                        pass
                     break
                 reasons.append(why_not)
             if not it.stays:
@@ -544,33 +548,37 @@ def still_goes(conn, it: RawItem) -> str | None:
     return None
 
 
-def _with_sidecars(conn, it: RawItem, mover) -> None:
-    """The RAW has just gone: the catalog says so at once (the photo stays, shown from its JPEG), and
-    its own sidecars follow it."""
-    cleanup.mark_moved(conn, it)
+def _with_sidecars(conn, it: RawItem, mover, log: cleanup.TrashLog) -> None:
+    """Just after the RAW was dealt with: if it went, its own sidecars follow it (each in the log at
+    once), then the catalog says so (the photo stays, shown from its JPEG); if not, they stay too."""
+    if it.result != cleanup.MOVED:
+        for s in it.sidecars:
+            s.result = "left alone: its RAW stayed"
+            log.file(s)
+        return
     for s in it.sidecars:
         try:
             now = os.lstat(s.path)
         except OSError:
             s.result = "left alone: gone already"
-            continue
-        if (now.st_size, now.st_mtime_ns) != (s.size, s.mtime_ns):
-            s.result = "left alone: changed since it was checked"
-            continue
-        try:
-            s.trashed_to = mover(s.path)
-            s.result = "moved to the Trash"
-        except OSError as e:
-            s.result = f"left alone: {e}"
+        else:
+            if (now.st_size, now.st_mtime_ns) != (s.size, s.mtime_ns):
+                s.result = "left alone: changed since it was checked"
+            else:
+                cleanup.trash_one(s, mover, now)
+        log.file(s)
+    cleanup.mark_moved(conn, it)
 
 
 def trash(conn, items: list[RawItem], log_name: str, mover: Callable[[str], str | None] | None = None,
           progress: Callable[[int, int], None] | None = None) -> str:
     """Move the RAWs the check found to the Trash, each checked again just before, with their own
     sidecars. One run at a time, across the app and the command line. Every RAW checked goes in the
-    log, moved or not (and its sidecars after it), as other moves to the Trash do. Returns the log."""
+    log, moved or not (and its sidecars after it), each as soon as it's dealt with, as other moves to
+    the Trash do. Returns the log."""
     mover = mover or cleanup.move_to_trash
     go = going(items)
+    going_ids = {id(i) for i in go}
     seen = []
 
     def check(it: RawItem) -> str | None:
@@ -579,15 +587,27 @@ def trash(conn, items: list[RawItem], log_name: str, mover: Callable[[str], str 
             progress(len(seen), len(go))
         return still_goes(conn, it)
 
-    with cleanup.trash_lock():
-        cleanup._move_files(go, mover, check, on_moved=lambda it: _with_sidecars(conn, it, mover))
-    rows: list = []
-    for it in items:
-        rows.append(it)
-        for s in it.sidecars:
-            s.result = s.result or "left alone: its RAW stayed"
-            rows.append(s)
-    return cleanup._log(rows, log_name)
+    try:
+        with cleanup.trash_lock(), cleanup.TrashLog(log_name) as log:
+            for it in items:
+                if id(it) not in going_ids:
+                    log.file(it)
+                    for s in it.sidecars:
+                        s.result = s.result or "left alone: its RAW stayed"
+                        log.file(s)
+            try:
+                cleanup._move_files(go, mover, check, log, after=lambda it: _with_sidecars(conn, it, mover, log))
+            finally:
+                log.rest(go)
+    except BaseException:
+        if any(i.result == cleanup.MOVED for i in go):     # stopped part way: the catalog still follows what went
+            try:
+                conn.rollback()
+                cleanup.mark_rest(conn, [i for i in go if i.result == cleanup.MOVED])
+            except Exception:
+                pass
+        raise
+    return str(log.path)
 
 
 def moved(items: list[RawItem]) -> tuple[list[RawItem], int]:

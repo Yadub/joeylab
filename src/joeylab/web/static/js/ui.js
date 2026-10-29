@@ -75,6 +75,7 @@ export const ICONS = {
   heartOn: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20s-7-4.4-7-10a4 4 0 017-2.6A4 4 0 0119 10c0 5.6-7 10-7 10z"/></svg>`,
   pin: P(`<path d="M12 21s-6-5.4-6-10.5a6 6 0 0112 0C18 15.6 12 21 12 21z"/><circle cx="12" cy="10.5" r="2.2"/>`),
   tag: P(`<path d="M3.5 12.2V4.5a1 1 0 011-1h7.7a1 1 0 01.7.3l8 8a1 1 0 010 1.4l-7.7 7.7a1 1 0 01-1.4 0l-8-8a1 1 0 01-.3-.7z"/><circle cx="8" cy="8" r="1.4"/>`),
+  chart: P(`<path d="M4 20h16"/><rect x="6" y="11" width="3" height="7" rx="1"/><rect x="11" y="6" width="3" height="12" rx="1"/><rect x="16" y="9" width="3" height="9" rx="1"/>`),
   calendar: P(`<rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/>`),
   people: P(`<circle cx="9" cy="8.5" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0111 0"/><circle cx="17" cy="9.5" r="2.5"/><path d="M15.5 14.2A4.5 4.5 0 0121 18.5"/>`),
   broom: P(`<path d="M14 4l6 6M12.5 5.5l6 6-6.5 6.5H6v-6z"/><path d="M6 18l-2 2"/>`),
@@ -323,8 +324,10 @@ export function popover(anchor, content, { label } = {}) {
   const r = anchor.getBoundingClientRect();
   const el = h("div", { class: "popover", tabindex: "-1" }, content);
   document.body.append(el);
-  const w = el.offsetWidth;
-  el.style.top = `${r.bottom + 6}px`;
+  const w = el.offsetWidth, ht = el.offsetHeight;
+  // Under its button, or above it when there's no room below (a bar at the foot of the screen).
+  const above = r.bottom + 6 + ht > window.innerHeight - 8 && r.top - ht - 6 >= 8;
+  el.style.top = `${above ? r.top - ht - 6 : r.bottom + 6}px`;
   el.style.left = `${Math.max(16, Math.min(r.left, window.innerWidth - w - 16))}px`;
   const menu = !!el.querySelector('[role="menuitem"]');
   el.setAttribute("role", menu ? "menu" : "dialog");

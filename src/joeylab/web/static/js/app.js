@@ -55,6 +55,12 @@ function placeHref(project, view) {
   try { q = REMEMBER.has(view) ? sessionStorage.getItem(`joeylab.place.${project}.${view}`) || "" : ""; } catch { q = ""; }
   return `#/p/${encodeURIComponent(project)}/${view}${q ? "?" + q : ""}`;
 }
+/** The filters the Library last showed in this browser tab (after a reload too). */
+function libraryFilter(project) {
+  let q = "";
+  try { q = sessionStorage.getItem(`joeylab.place.${project}.library`) || ""; } catch { q = ""; }
+  return Object.fromEntries([...new URLSearchParams(q)].filter(([k, v]) => v && library.FILTER_KEYS.includes(k)));
+}
 /** Another library, in the same section (a search keeps its words; a library's own filters don't carry over). */
 export function switchTo(project) {
   const r = route;
@@ -124,7 +130,7 @@ async function navigate() {
     store.rows.clear();
     store.overview = null;
     store.settings = null;
-    store.libraryParams = {};
+    store.libraryParams = libraryFilter(r.project);   // the Library's filter, kept for this tab (Albums and Export offer it)
     store.peopleList = null;
     store.keywordTree = null;
     forgetDetails();
@@ -395,7 +401,12 @@ function libraryChanged(j) {
   // Part way through an update: its new photos are stacked and scored; faces, search and places follow.
   const early = j?.state === "running" && (j.ready || []).includes("group");
   if (early && viewEl.querySelector(".wait-note:not([hidden]) button")) return;     // the page's own note offers it
-  toast(early ? "New photos are stacked and scored; faces, search and places follow" : "Library updated with new or changed photos",
+  // Said only when files were added, changed or gone (an update that read faces or search alone
+  // changes nothing you'd reload for).
+  const f = j?.files || {};
+  const found = [f.added && plural(f.added, "new file"), f.changed && `${n(f.changed)} changed`, f.gone && `${n(f.gone)} gone`].filter(Boolean);
+  if (!early && !found.length) return;
+  toast(early ? "New photos are stacked and scored; faces, search and places follow" : `Library updated: ${found.join(", ")}`,
     { action: () => current?.api?.refresh?.(), actionLabel: "Show", key: "updated", persist: true });
 }
 

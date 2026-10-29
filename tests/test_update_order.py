@@ -63,7 +63,7 @@ def test_update_stacks_duplicates_and_suggestions_before_the_slow_steps(env, mon
             return 0
         return run
 
-    for name in ("run_faces", "run_ai", "run_search_index"):
+    for name in ("run_faces", "run_face_quality", "run_ai", "run_search_index", "run_pets"):
         monkeypatch.setattr(pipeline, name, slow(name))
     order = []
 
@@ -76,7 +76,7 @@ def test_update_stacks_duplicates_and_suggestions_before_the_slow_steps(env, mon
 
     conn = db.connect("t")
     out = pipeline.run_all(conn, "t", Rep(), faces=True, ai_layer=True)
-    for name in ("run_faces", "run_ai", "run_search_index"):
+    for name in ("run_faces", "run_face_quality", "run_ai", "run_search_index", "run_pets"):
         assert seen[name]["stacks"] == 1 and seen[name]["dupes"] == 1 and seen[name]["suggestions"] > 0, (name, seen)
         assert seen[name]["events"] == 0                       # places and events come after the slow steps
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] > 0

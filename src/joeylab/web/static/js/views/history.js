@@ -20,6 +20,8 @@ export function mount(root, ctx) {
   root.append(page);
   const lib = (q) => `#/p/${encodeURIComponent(p)}/library?${new URLSearchParams(q).toString()}`;
   let focusAt = -1;
+  let quiet = false;                 // an Undo pressed in a row: that row changes, not the whole page
+  let redoHere = null;               // the Redo button's place at the top of the list
 
   function params() {
     const q = { tab: tab === "changes" ? "" : tab };
@@ -51,7 +53,7 @@ export function mount(root, ctx) {
     const since = ctx.params.get("since") || "", until = ctx.params.get("until") || "";
     const list = h("div", { class: "history-list", role: "list" });
     const moreBtn = h("button", { class: "btn", hidden: true }, "Show more");
-    const redoSlot = h("span");
+    const redoSlot = redoHere = h("span");
     const total = h("span", { class: "muted" });
     const day = (id, label, value, other) => h("label", { class: "field-inline" }, h("span", { class: "muted" }, label),
       h("input", { type: "date", class: "input", id, value, "aria-label": label,
@@ -105,8 +107,21 @@ export function mount(root, ctx) {
       h("div", { class: "grow history-what" }, h("b", {}, s.label), h("div", { class: "muted small" }, what)),
       h("div", { class: "history-acts" },
         h("a", { class: "btn ghost small", href: lib({ step: s.batch, all: "1" }), title: "Open the Library on exactly these photos" }, "Show these photos"),
-        !s.undone && !isUndo ? h("button", { class: "btn small", onclick: () => undo(s.batch) }, icon("undo"), "Undo") : null,
+        !s.undone && !isUndo ? h("button", { class: "btn small", onclick: (e) => undoStep(s, e.currentTarget.closest(".history-row")) }, icon("undo"), "Undo") : null,
         isUndo && s.batch === redoable ? h("button", { class: "btn small", onclick: () => redo() }, icon("refresh"), "Redo") : null));
+  }
+
+  /** Undo a step from its row: the row says it's undone and the page stays where it was (with the
+   * steps loaded so far), rather than starting again from the top. */
+  async function undoStep(s, rowEl) {
+    quiet = true;
+    let res;
+    try { res = await undo(s.batch); } finally { quiet = false; }
+    if (!res?.undone || !rowEl?.isConnected) return;
+    const now = stepRow({ ...s, undone: 1 }, null);
+    rowEl.replaceWith(now);
+    now.focus({ preventScroll: true });
+    if (redoHere) clear(redoHere).append(h("button", { class: "btn small", title: "Put back what you last undid (⇧U)", onclick: () => redo() }, icon("refresh"), "Redo"));
   }
 
   // ------------------------------------------------------------ moves to the Trash
@@ -180,7 +195,7 @@ export function mount(root, ctx) {
   // Undo and Redo (here, from U and ⇧U, or anywhere else) and Put Back show at once.
   let soon = 0;
   function later() { clearTimeout(soon); soon = setTimeout(render, 60); }
-  const off = on((type) => { if (type === "history") later(); });
+  const off = on((type) => { if (type === "history" && !quiet) later(); });
 
   return {
     // J and K (or the arrows) move between steps; Enter shows the photos of the one in focus.

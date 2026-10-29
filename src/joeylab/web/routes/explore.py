@@ -9,7 +9,7 @@ import dataclasses
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ... import colours, explore
-from ..deps import big_json, conn_dep, filter_from, viewer_of
+from ..deps import big_json, conn_dep, filter_for, viewer_of
 from .library import browse_filter
 
 router = APIRouter()
@@ -20,7 +20,7 @@ def api_explore(p: str, request: Request, conn=Depends(conn_dep)):
     """The photos the Library's filters show (as its grid would), the arrangements that can be made
     here (True, or why not), and how far measuring the photos' colours is."""
     q = request.query_params
-    raw = filter_from(q, viewer_of(request))
+    raw = filter_for(conn, q, viewer_of(request))
     flt = raw if q.get("all") in ("1", "true") else browse_filter(conn, dataclasses.replace(raw))
     return big_json({"shown": explore.shown_ids(conn, flt), "available": explore.available(conn), "measuring": colours.backfill(p)})
 

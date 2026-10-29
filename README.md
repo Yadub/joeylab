@@ -17,7 +17,8 @@ Made by **Yaduraj Bhageria**. Released under the [MIT licence](LICENSE).
 * **Cull a shoot:** one burst or scene at a time, the best frame suggested, closed eyes and soft focus flagged,
   one key per decision.
 * **Find anything:** type "dog on a beach", "a red umbrella" or "the cake". Search runs on the Mac, with no tagging.
-* **People:** faces grouped for you to name once; a child's younger and older groups offered as the same person.
+* **People and pets:** faces grouped for you to name once; a child's younger and older groups offered as the same
+  person; dogs and cats found and grouped too, so your pet is named once and found everywhere.
 * **Events, trips and places:** found from time, place and folder names; place names worked out offline.
 * **Tidy:** duplicates on each drive, backups (which photos have an identical copy on another drive, and which exist
   on one drive only), damaged and undated files, camera clocks that disagree.
@@ -422,7 +423,9 @@ is indexed on the Mac in three ways:
 * **SigLIP 2** (`ViT-B-16-SigLIP2-384`) on the whole frame plus 9 overlapping zoomed-in tiles, so small objects are
   found, and results show a box where the match is.
 * **Apple Vision labels:** 1,300+ objects and scenes, such as dog, door, receipt and cake.
-* **Apple Vision text recognition:** words on signs, cakes and documents.
+* **Apple Vision text recognition:** words on signs, cakes and documents, in every language Vision reads (English,
+  French, German, Italian, Spanish, Portuguese, Chinese, Japanese, Korean, Russian, Ukrainian, Thai, Vietnamese and
+  Arabic on macOS 15), telling which one the text is in.
 
 Results are graded *strong* or *possible*; unlikely ones are hidden unless you ask. Indexing reads the local 768 px
 thumbnails, not your originals, at about 3 photos a second on an M2 Pro. The search box also takes plain language
@@ -469,6 +472,17 @@ With recognition on:
 
 Settings › People & privacy also removes every face, name and face crop at once.
 
+**Pets.** Apple Vision finds the dogs and cats in every photo (on the Mac, with nothing to download or turn on),
+and the search model groups them by how alike they look. They wait under **Name faces › Pets to name**: name your
+pet's biggest group, and **Is this …?** asks about its other groups. A named pet is listed with the pets, and
+searching for its name, the Library's people filter and ⌘K find its photos. **Not ours** hides someone else's pet
+or a stray. The search model isn't made to tell animals apart, so two dogs of one breed and colour can share a
+group: "Not them" in **Check faces** takes one out.
+
+A dog's face that the face models took for a person's leaves people's groups when Apple Vision sees the dog and
+no one there; a face you named is never moved. **Name faces › Animals' faces** lists them, and **A person** puts
+one back for good.
+
 ### It learns your taste
 
 After about 12 picks and 12 rejects, JoeyLab trains a small model on your decisions, using the picture's AI
@@ -506,7 +520,9 @@ Suggestions are hints and never become ratings unless you accept them:
   another time zone than home's. **Set place…** on an event or trip replaces any guess and stays.
 * Event names come from folder names when those say something ("2024-06 Lisbon trip" gives "Lisbon trip").
   Otherwise they come from what most of the photos show ("Dance performance", "Climbing", "Wedding"), judged on
-  the Mac by the search model, and then from the place and date.
+  the Mac by the search model, and then from the place and date. An Indian wedding's occasions are named too
+  (haldi, mehendi, sangeet, baraat, varmala, pheras, vidaai, the reception), and so are sadya, pookalam,
+  Diwali and Holi; an event that mixes a wedding's occasions is a "Wedding".
 * Your own names stay across updates, and while the drive with the photos is unplugged.
 * Places come from GPS in the photos, looked up offline in the GeoNames town list. Photos without GPS borrow the
   place of a photo taken within 3 hours (often a phone shot at the same event).
@@ -692,7 +708,8 @@ pick|reject|check --flag F --min-quality Q --camera S --in PATH_SUBSTR --from YY
 | sharpness | Laplacian variance: the sharpest tiles (the subject, tolerant of bokeh) and the faces |
 | exposure | clipped highlights and shadows, brightness |
 | faces, closed eyes, smiles | MediaPipe face landmarker blendshapes (big laughs aren't counted as closed eyes) |
-| aesthetics | LAION aesthetic predictor on CLIP ViT-L/14 |
+| face quality | Apple Vision's face capture quality (focus, light, expression, how the head is turned), per face; a quarter of the faces part of the score, and in Cull's face compare it only chooses between frames with as many eyes open |
+| aesthetics | LAION aesthetic predictor on CLIP ViT-L/14, with Apple Vision's aesthetics score (kept with the search index on a Mac) as a quarter of it |
 | stacks | time gap and perceptual hash, plus CLIP similarity when the `ai` extra is installed |
 | duplicates | identical bytes on the same drive (hashed only among files of the same size) and re-saved copies (same capture instant, near-identical pixels) |
 | backups | the same size and quick fingerprint as a file on another drive, in any library, makes a probable backup; the whole of both files is then read in the background, slowly, to check it |

@@ -51,6 +51,24 @@ FILTER_KEYS = ("status", "min_rating", "suggested", "flag", "no_flag", "min_q", 
                "keyword", "not_keyword", "untagged", "no_album", "filetype", "month", "step", "raw")
 
 
+def with_search(conn, f: Filter) -> Filter:
+    """A filter's picture search (the Library showing a search's matches, `q`) turned into the photos it
+    matches: every frame the search finds strongly or possibly, within any ids the filter already has."""
+    if f.search:
+        from .routes.ai import picture_match_ids
+
+        found = picture_match_ids(conn, f.search)
+        keep = set(found)
+        f.ids = found if f.ids is None else [i for i in f.ids if i in keep]
+        f.search = None
+    return f
+
+
+def filter_for(conn, q: Mapping[str, Any], viewer: str | None = None) -> Filter:
+    """filter_from, with its picture search (if any) already turned into the photos it matches."""
+    return with_search(conn, filter_from(q, viewer))
+
+
 def filter_from(q: Mapping[str, Any], viewer: str | None = None) -> Filter:
     status = q.get("status") or "all"
     min_rating = _int(q.get("min_rating"))
@@ -74,7 +92,7 @@ def filter_from(q: Mapping[str, Any], viewer: str | None = None) -> Filter:
         favs_of=(viewer or "owner") if favs in ("me", "1", "true") else (favs or None), c2pa=_bool(q.get("c2pa")),
         keyword=_keywords(q.get("keyword")), not_keyword=ids_of(q.get("not_keyword")), untagged=_bool(q.get("untagged")),
         no_album=_bool(q.get("no_album")), file_kind=q.get("filetype") or None, month=_int(q.get("month")),
-        step=q.get("step") or None, raw=q.get("raw") or None, backup=q.get("backup") or None,
+        search=str(q.get("q") or "").strip() or None, step=q.get("step") or None, raw=q.get("raw") or None, backup=q.get("backup") or None,
     )
 
 

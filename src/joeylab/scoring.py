@@ -39,6 +39,33 @@ def _ramp(x: float | None, lo: float, hi: float) -> float | None:
     return float(min(1.0, max(0.0, (math.log10(x) - lo) / (hi - lo))))
 
 
+# How well the faces are caught (Apple Vision's face capture quality, faces.measure_quality): most faces
+# score between these (a real library's: 10% below 0.15, 10% above 0.51). It's this share of the faces
+# part, so a turned head or a passing frown never outweighs closed eyes, nor decides on its own.
+CAUGHT_LOW, CAUGHT_HIGH = 0.15, 0.55
+CAUGHT_SHARE = 0.25
+# Apple Vision's aesthetics score (vision.score, -1 to 1, stored with the search index): from a snapshot to
+# a strong image (a real library's: 10% below 0.32, 10% above 0.67). It agrees only loosely with the LAION
+# predictor (r = 0.34 there), so it's a modest share of the aesthetic part, and only beside it.
+APPLE_LOW, APPLE_HIGH = 0.25, 0.85
+APPLE_SHARE = 0.25
+
+
+def caught(q: float | None) -> float | None:
+    """A face capture quality as 0-1 over the range most faces fall in; None when not judged."""
+    if q is None or q < 0:
+        return None
+    return min(1.0, max(0.0, (q - CAUGHT_LOW) / (CAUGHT_HIGH - CAUGHT_LOW)))
+
+
+def _part(m, key: str):
+    """A column the row may not have (rows read before it existed, or without it)."""
+    try:
+        return m[key]
+    except (IndexError, KeyError):
+        return None
+
+
 def components(m) -> dict:
     subj = _ramp(m["sharp_subject"], 1.8, 3.7)          # ~63 .. ~5000 Laplacian variance
     face = _ramp(m["face_sharp"], 1.3, 2.3) if m["main_faces"] else None   # ~20 soft .. ~200 crisp
@@ -61,11 +88,18 @@ def components(m) -> dict:
     if m["main_faces"]:
         faces = 1.0 - 0.8 * (m["eyes_closed"] / m["main_faces"]) + 0.15 * (m["smile"] or 0)
         faces = min(1.0, max(0.0, faces))
+        how = caught(_part(m, "face_quality"))
+        if how is not None:
+            faces = (1 - CAUGHT_SHARE) * faces + CAUGHT_SHARE * how
 
     aesthetic = None
     if m["aesthetic"] is not None:
         # LAION predictor: ~4.6 snapshot .. ~6.2 strong image on real event photos
         aesthetic = min(1.0, max(0.0, (m["aesthetic"] - 4.6) / 1.6))
+        apple = _part(m, "vision_score")
+        if apple is not None:
+            apple = min(1.0, max(0.0, (apple - APPLE_LOW) / (APPLE_HIGH - APPLE_LOW)))
+            aesthetic = (1 - APPLE_SHARE) * aesthetic + APPLE_SHARE * apple
     return {"sharp": sharp, "exposure": exposure, "faces": faces, "aesthetic": aesthetic}
 
 
@@ -115,8 +149,9 @@ def explain(conn, shot_id: int) -> list[dict]:
     {"kind": good|bad|info, "text": ...}."""
     from . import taste
 
+    vs = _vision_score(conn)
     m = conn.execute(
-        "SELECT m.*, s.group_id, s.width, s.height, COALESCE(s.media, 'photo') AS media, g.size AS group_size"
+        f"SELECT m.*, s.group_id, s.width, s.height, COALESCE(s.media, 'photo') AS media, g.size AS group_size, {vs} AS vision_score"
         " FROM metrics m JOIN shots s ON s.id = m.shot_id LEFT JOIN groups g ON g.id = s.group_id WHERE m.shot_id = ?",
         (shot_id,)).fetchone()
     if not m:
@@ -126,7 +161,7 @@ def explain(conn, shot_id: int) -> list[dict]:
     c = components(m)
     trusted = bool(taste.meta().get("trusted"))
     mates = conn.execute(
-        "SELECT m.*, s.id, s.stem, s.eff_ts FROM metrics m JOIN shots s ON s.id = m.shot_id WHERE s.group_id = ?"
+        f"SELECT m.*, s.id, s.stem, s.eff_ts, {vs} AS vision_score FROM metrics m JOIN shots s ON s.id = m.shot_id WHERE s.group_id = ?"
         " AND s.status = 'present' ORDER BY COALESCE(m.group_rank, 999), s.id", (m["group_id"],)).fetchall() \
         if m["group_id"] is not None else []
     if len(mates) > 1:
@@ -204,6 +239,13 @@ def explain(conn, shot_id: int) -> list[dict]:
     return out
 
 
+def _vision_score(conn) -> str:
+    """SQL for a photo's Apple Vision aesthetics score (s: its row in shots), if the catalog has them."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='vision'").fetchone():
+        return "(SELECT score FROM vision v WHERE v.shot_id = s.id)"
+    return "NULL"
+
+
 PARTS = {"sharp": "focus", "exposure": "exposure", "faces": "faces and eyes", "aesthetic": "composition and light",
          "taste": "your taste"}
 
@@ -272,11 +314,14 @@ def run(conn) -> dict:
     from .config import TINY_SIDE
 
     has_vision = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='vision'").fetchone())
-    utility = "(SELECT utility FROM vision v WHERE v.shot_id = s.id)" if has_vision else "NULL"
+    # (Apple Vision's utility flag and aesthetics score, read from one look-up of each photo's row)
+    vision, join = (("v.utility AS utility, v.score AS vision_score", " LEFT JOIN vision v ON v.shot_id = s.id") if has_vision
+                    else ("NULL AS utility, NULL AS vision_score", ""))
     rows = conn.execute(
         "SELECT m.*, s.group_id, s.phash, s.width, s.height, s.eff_ts, COALESCE(s.media, 'photo') AS media, s.error AS shot_error,"
         " (SELECT MAX(kind='raw') FROM files f WHERE f.shot_id = s.id AND f.status='present') AS has_raw,"
-        f" {utility} AS utility FROM metrics m JOIN shots s ON s.id = m.shot_id WHERE s.status='present'"
+        f" {vision} FROM metrics m JOIN shots s ON s.id = m.shot_id{join}"
+        " WHERE s.status='present'"
     ).fetchall()
     embs = load_embeddings(conn)
     phashes = {m["shot_id"]: to_u64(m["phash"]) for m in rows if m["phash"] is not None}

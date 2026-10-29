@@ -97,3 +97,41 @@ def test_why_explains_rank_in_the_stack_and_breaks_ties(env):
     tie = scoring.explain(conn, second["id"])[0]["text"]
     assert tie.startswith("2nd of 3: level with") and f"{first['stem']} ranks first as the" in tie
     assert scoring.ordinal(1) == "1st" and scoring.ordinal(12) == "12th" and scoring.ordinal(23) == "23rd"
+
+
+def test_apple_visions_aesthetics_score_counts_modestly(env):
+    """Apple Vision's aesthetics score (stored with the search index) is a modest share of the aesthetic
+    part, beside the LAION predictor's, and read when photos are scored."""
+    from joeylab import scoring, search
+
+    base = {"sharp_subject": 800, "face_sharp": None, "main_faces": 0, "face_area": None, "brightness": 120,
+            "clip_high": 0, "clip_low": 0, "eyes_closed": 0, "smile": None, "aesthetic": 5.4}
+    plain = scoring.components(base)["aesthetic"]
+    strong = scoring.components({**base, "vision_score": 0.9})["aesthetic"]
+    weak = scoring.components({**base, "vision_score": -0.5})["aesthetic"]
+    assert weak < plain < strong and strong - weak <= scoring.APPLE_SHARE + 1e-9
+    assert scoring.components({**base, "aesthetic": None, "vision_score": 0.9})["aesthetic"] is None   # never on its own
+
+    _, lib = env
+    for i in range(2):
+        frame(lib / f"IMG_{i}.JPG", seed=i, when=f"2024:05:0{i + 1} 10:00:00")
+    add_root(lib)
+    conn, _ = run_all()
+    a, b = [r[0] for r in conn.execute("SELECT id FROM shots ORDER BY id")]
+    conn.execute("UPDATE metrics SET aesthetic = 5.4")
+    search.ensure_schema(conn)
+    for sid, score in ((a, 0.9), (b, -0.5)):
+        conn.execute("INSERT INTO vision(shot_id, src, labels, text, utility, score) VALUES (?, 'x', '[]', '', 0, ?)", (sid, score))
+    conn.commit()
+    quality = lambda: [conn.execute("SELECT quality FROM metrics WHERE shot_id=?", (x,)).fetchone()[0] for x in (a, b)]  # noqa: E731
+    share = scoring.APPLE_SHARE
+    try:
+        scoring.APPLE_SHARE = 0.0
+        scoring.run(conn)
+        without = quality()
+    finally:
+        scoring.APPLE_SHARE = share
+    scoring.run(conn)
+    with_apple = quality()
+    assert with_apple[0] > without[0] and with_apple[1] < without[1]
+    assert max(abs(x - y) for x, y in zip(with_apple, without)) < 10        # modest: a few points at most

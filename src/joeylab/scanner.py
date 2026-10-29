@@ -2,15 +2,20 @@
 
 Each scan reconciles the catalog with what is on disk:
   * new files are added,
-  * files whose size/mtime changed are re-fingerprinted and re-analysed,
+  * files whose size/mtime changed are re-fingerprinted; with other content, a known path holds
+    a file the catalog knows that left its own place (moved onto it, as Finder's "Replace" does:
+    that photo comes along, with its decisions), the same photo edited (re-analysed), or another
+    photo (a new one; the one that was there goes missing, its decisions with it),
   * files that disappeared are matched against new paths, so a move or rename keeps its
     ratings and analysis: first without reading anything (the same inode, size and modified
     time on the same drive; or the same name, size and modified time in the folder the others
-    went to, as when a folder is renamed), then by content fingerprint,
+    went to, as when a folder is renamed), then by content fingerprint; a folder that moved
+    whole takes everything kept by its path along (folder names, keep rules, albums),
   * anything left over is marked missing (never forgotten automatically, so
     decisions survive a disk being unplugged or a folder being moved back),
   * roots that are not mounted/available are skipped rather than emptied, and so are
-    folders that couldn't be read (a permission prompt, a flaky USB cable).
+    folders that couldn't be read (a permission prompt, a flaky USB cable), and folders
+    moved to another library (followed by inode when renamed in Finder).
 
 Files are only ever opened for reading. Fingerprints are computed before the catalog is
 locked for writing, so the web app stays responsive while a card is imported.
@@ -20,13 +25,15 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import dating, db, exif
+from . import dating, db, exif, volumes
 from .config import HOME, SETTLE_SECONDS, kind_for
 from .hashing import quick_fp
 
@@ -109,12 +116,35 @@ def _stat_key(st: os.stat_result) -> tuple:
 
 
 def _walk(root: str, root_id: int, now: float, report: ScanReport, on_disk: dict, settling: set,
-          excluded: frozenset = frozenset()):
+          excluded: frozenset = frozenset(), lost: dict | None = None, followed: dict | None = None,
+          owned: Callable[[str], bool] | None = None):
+    """Every photo file under a library folder, into on_disk (or settling, while still being copied).
+    `lost`: {(drive, inode): folder} for folders the library leaves out that aren't at their path any
+    more; one met here with that inode on that drive (and holding none of this library's files) is the
+    same folder, renamed or moved in Finder: it's left out too, and noted in `followed` {old path: new}."""
     home = str(HOME)
 
     def failed(err: OSError) -> None:
         report.unreadable.append(err.filename or root)
         report.errors.append(f"{err.filename}: couldn't read this folder ({err.strerror})")
+
+    def left_out(path: str) -> bool:
+        if path in excluded:                    # moved to another library (split.py)
+            return True
+        if not lost:
+            return False
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        key = (st.st_dev, db.to_i64(st.st_ino))
+        old = lost.get(key)
+        if old is None or (owned and owned(path)):
+            return False
+        del lost[key]
+        if followed is not None:
+            followed[old] = path
+        return True
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=failed):
         try:
@@ -123,8 +153,7 @@ def _walk(root: str, root_id: int, now: float, report: ScanReport, on_disk: dict
             pass
         dirnames[:] = sorted(
             d for d in dirnames
-            if not d.startswith(".") and os.path.join(dirpath, d) != home
-            and os.path.join(dirpath, d) not in excluded           # moved to another library (split.py)
+            if not d.startswith(".") and os.path.join(dirpath, d) != home and not left_out(os.path.join(dirpath, d))
         )
         for name in filenames:
             if name.startswith("."):
@@ -233,6 +262,141 @@ def _moved_without_reading(vanished: list, new_paths: list[str], on_disk: dict, 
     return found
 
 
+def _take(pool: dict, fp: str, path: str, ino: int | None):
+    """The vanished file with this content (popped from the pool), if any. Of identical copies, the
+    one with this file's inode is the one that moved; then the one with its name."""
+    rows = pool.get(fp)
+    if not rows:
+        return None
+    k = next((j for j, r in enumerate(rows) if ino is not None and ino > 0 and r["ino"] == ino), None)
+    if k is None:
+        name = os.path.basename(path)
+        k = next((j for j, r in enumerate(rows) if os.path.basename(r["path"]) == name), 0)
+    return rows.pop(k)
+
+
+def _same_capture(old: dict | None, new: dict | None) -> bool:
+    """Both carry a capture time, the same to the second, and the same camera wherever both name one."""
+    if not old or not new or old.get("capture_ts") is None or new.get("capture_ts") is None:
+        return False
+    if abs(old["capture_ts"] - new["capture_ts"]) >= 1:
+        return False
+    return all(not old.get(k) or not new.get(k) or old[k] == new[k] for k in ("camera", "body_serial"))
+
+
+def _edited(conn, rows: dict[str, object], on_disk: dict) -> set[str]:
+    """Of these known paths with different content now (none of it a photo the catalog knows), the
+    ones that still hold the same photo, edited: the same file written again where it is (its inode
+    unchanged, on a drive whose inode numbers mean something), or a file taken at the same moment by
+    the same camera (an editor that saves a new file in its place keeps that). Anything else is another
+    photo put in its place. Only these files' metadata is read here."""
+    same = {p for p, r in rows.items() if r["ino"] is not None and r["ino"] > 0 and r["ino"] == on_disk[p][6]}
+    rest = [p for p in rows if p not in same]
+    if not rest or not exif.available():
+        return same
+    ids = [rows[p]["id"] for p in rest]
+    metas: dict[int, str | None] = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i : i + 500]
+        metas.update(conn.execute(f"SELECT id, meta FROM files WHERE id IN ({','.join('?' * len(chunk))})", chunk).fetchall())
+    tags, done = exif.read_many([p for p in rest if on_disk[p][4] != "video"])
+    vtags, vdone = exif.read_many([p for p in rest if on_disk[p][4] == "video"], batch=50, fast=False)
+    tags.update(vtags)
+    done |= vdone
+    for p in rest:
+        if p not in done:
+            continue
+        try:
+            old = json.loads(metas.get(rows[p]["id"]) or "null")
+        except ValueError:
+            old = None
+        if _same_capture(old, exif.summarize(tags.get(p, {}))):
+            same.add(p)
+    return same
+
+
+def _vacated_path(row) -> str:
+    """Where a catalog row goes when another photo takes its path: beside it, under a name no photo
+    file can have (its extension isn't a photo's), so the scan never mistakes a file for it, and the
+    row stays unique."""
+    return f"{row['path']} (replaced {row['id']})"
+
+
+def _within(paths: list[str], folder: str) -> list[str]:
+    """The paths strictly inside a folder, from a sorted list."""
+    lo, hi = folder.rstrip(os.sep) + os.sep, folder.rstrip(os.sep) + "0"
+    return paths[bisect_left(paths, lo):bisect_left(paths, hi)]
+
+
+def _folders_renamed(moves: dict[str, str], known: dict, on_disk: dict, roots: list[str]) -> list[tuple[str, str]]:
+    """Folders renamed or moved in Finder with everything in them, from the files found moved
+    ({old path: new path}): [(old folder, new folder)], the outermost only. A folder counts when it's
+    gone, every file of it the catalog had (and wasn't missing already) is at the same place inside the
+    new folder, and the new folder holds nothing else: no file the catalog had there before and no
+    photo that didn't come from the old one. Anything less (a folder split in two, a photo added to
+    it meanwhile) keeps what's kept by folder where it was."""
+    def inside_root(p: str) -> bool:
+        return any(p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+    cands: set[tuple[str, str]] = set()
+    for old, new in moves.items():
+        if os.path.basename(old) != os.path.basename(new):
+            continue
+        a, b = os.path.dirname(old), os.path.dirname(new)
+        while a != b and inside_root(a) and inside_root(b) and (a, b) not in cands:
+            cands.add((a, b))
+            if os.path.basename(a) != os.path.basename(b):
+                break
+            a, b = os.path.dirname(a), os.path.dirname(b)
+    if not cands:
+        return []
+    known_paths, disk_paths = sorted(known), sorted(on_disk)
+    ok = []
+    for a, b in cands:
+        if os.path.lexists(a) or not os.path.isdir(b) or _within(known_paths, b):
+            continue
+        came = set()
+        for p in _within(known_paths, a):
+            to = volumes.moved_path(p, a, b)
+            if moves.get(p) == to:
+                came.add(to)
+            elif known[p]["status"] != "missing":
+                break
+        else:
+            if came and set(_within(disk_paths, b)) == came:
+                ok.append((a, b))
+    return [(a, b) for a, b in ok if not any(a != x and a.startswith(x.rstrip(os.sep) + os.sep) for x, _ in ok)]
+
+
+def _left_out(conn) -> dict[str, int | None]:
+    """{folder: its inode} for the folders this library leaves out."""
+    try:
+        return dict(conn.execute("SELECT folder, ino FROM excluded_folders").fetchall())
+    except sqlite3.OperationalError:          # a catalog read before its upgrade
+        return {f: None for f in db.excluded_folders(conn)}
+
+
+def _follow_left_out(conn, left: dict[str, int | None], followed: dict[str, str], excluded: frozenset) -> frozenset:
+    """Folders left out that were found again under another path (`followed`, by the walk) are left out
+    there from now on; each one's inode is kept up to date. Returns the folders left out now."""
+    changed = False
+    for old, new in followed.items():
+        volumes.rewrite_left_out(conn, old, new)
+        changed = True
+    for f, ino in left.items():
+        f = followed.get(f, f)
+        try:
+            now = db.to_i64(os.lstat(f).st_ino)
+        except OSError:
+            continue
+        if now != ino:
+            conn.execute("UPDATE excluded_folders SET ino=? WHERE folder=?", (now, f))
+            changed = True
+    if changed:
+        conn.commit()
+    return frozenset(followed.get(f, f) for f in excluded)
+
+
 def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanReport:
     report = ScanReport()
     now = time.time()
@@ -241,15 +405,31 @@ def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanR
     on_disk: dict[str, tuple] = {}
     settling: set[str] = set()
 
-    from . import volumes
-
     drives = volumes.check_roots(conn)          # follow renamed drives; never scan a stranger's
     report.roots_moved = drives["moved"]
     report.roots_wrong_drive = drives["wrong_drive"]
     roots = conn.execute("SELECT id, path, ino FROM roots").fetchall()
     # Folders this library leaves out (they were moved to another library): never walked, and what
-    # the catalog may still hold under them is neither "seen" nor "missing".
-    excluded = frozenset(db.excluded_folders(conn))
+    # the catalog may still hold under them is neither "seen" nor "missing". One that isn't at its
+    # path any more is looked for by its inode as the folders are walked (renamed or moved in Finder,
+    # or the folder above it renamed), so it isn't taken for new photos.
+    left = _left_out(conn)
+    excluded = frozenset(left)
+    lost: dict[tuple[int, int], str] = {}        # looked for on the drive of the library folder it was in
+    for f, ino in left.items():
+        if ino is None or ino <= 0 or os.path.lexists(f):          # (made-up inode numbers are negative here)
+            continue
+        root = max((r["path"] for r in roots if _under(f, [r["path"]]) and f != r["path"]), key=len, default=None)
+        try:
+            lost[(os.stat(root).st_dev, ino)] = f
+        except (OSError, TypeError):
+            pass
+    followed: dict[str, str] = {}
+
+    def owned(path: str) -> bool:
+        lo, hi = path.rstrip(os.sep) + os.sep, path.rstrip(os.sep) + "0"
+        return conn.execute("SELECT 1 FROM files WHERE path >= ? AND path < ? LIMIT 1", (lo, hi)).fetchone() is not None
+
     root_dev: dict[int, int] = {}          # the drive each scanned root is on now
     for r in roots:
         if r["path"] in excluded:
@@ -260,7 +440,7 @@ def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanR
             if progress:
                 progress(f"walking {r['path']}", 0, 0)
             before = len(report.unreadable)
-            _walk(r["path"], r["id"], now, report, on_disk, settling, excluded)
+            _walk(r["path"], r["id"], now, report, on_disk, settling, excluded, lost, followed, owned)
             # Gone by the end of the walk (unplugged mid-scan)? Then nothing under it is "missing".
             if r["path"] in report.unreadable[before:] or not os.path.isdir(r["path"]):
                 report.roots_unavailable.append(r["path"])
@@ -277,33 +457,34 @@ def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanR
         else:
             report.roots_unavailable.append(r["path"])
     report.seen = len(on_disk)
+    excluded = _follow_left_out(conn, left, followed, excluded)
 
     # ---- phase 1: work out every change, reading files but not writing the catalog
     db_files = {row["path"]: row for row in conn.execute(
         "SELECT id, path, root_id, size, mtime_ns, fp, status, ino FROM files")}
     updates: list[tuple] = []        # (sql, args)
     vanished = []
+    rewritten: dict[str, tuple] = {}     # known paths whose content is different now: {path: (row, fingerprint)}
     for path, row in db_files.items():
         if path in settling:
             continue
         if path in on_disk:
             _, size, mtime_ns, _, _, _, ino = on_disk[path]
-            if row["ino"] != ino:            # recorded for the first time, or the file was replaced
-                updates.append(("UPDATE files SET ino=? WHERE id=?", (ino, row["id"])))
-            if row["status"] == "missing":
-                report.returned += 1
-            if size != row["size"] or mtime_ns != row["mtime_ns"]:
+            written = size != row["size"] or mtime_ns != row["mtime_ns"]
+            if written:
                 try:
                     fp = quick_fp(path, size)
                 except OSError as e:
                     report.errors.append(f"{path}: {e}")
                     continue
                 if fp != row["fp"]:
-                    report.changed += 1
-                    updates.append((
-                        "UPDATE files SET size=?, mtime_ns=?, fp=?, full_hash=NULL, exif_done=0,"
-                        " status='present', last_seen=? WHERE id=?", (size, mtime_ns, fp, scan_id, row["id"])))
+                    rewritten[path] = (row, fp)          # the same photo edited, or another one: see below
                     continue
+            if row["ino"] != ino:            # recorded for the first time, or the file was written again
+                updates.append(("UPDATE files SET ino=? WHERE id=?", (ino, row["id"])))
+            if row["status"] == "missing":
+                report.returned += 1
+            if written:
                 # Same first and last bytes, but the file was written again: its full hash may be out of
                 # date (duplicates are only ever decided on a fresh one).
                 updates.append(("UPDATE files SET size=?, mtime_ns=?, full_hash=NULL, status='present', last_seen=? WHERE id=?",
@@ -323,25 +504,55 @@ def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanR
     for row in vanished:
         if row["id"] not in taken:
             pool[row["fp"]].append(row)
+
+    # A known path with different content: a photo that left its own place may be here now (moved onto
+    # it, as when Finder replaces a file), and comes with everything about it. Otherwise it's the same
+    # photo edited, or another photo put in its place: a new one. Either way the photo that was here
+    # leaves the path, to wherever its file went, or missing.
+    fps: dict[str, str] = {}                 # fingerprints of known paths still to place
+    vacated: list = []                       # catalog rows whose path another photo has now
+    for path, (row, fp) in rewritten.items():
+        old = _take(pool, fp, path, on_disk[path][6])
+        if old is not None:
+            found[path] = old
+            vacated.append(row)
+        else:
+            fps[path] = fp
+    edited = _edited(conn, {p: rewritten[p][0] for p in fps}, on_disk)
+    for path in list(fps):
+        row = rewritten[path][0]
+        if path not in edited:
+            vacated.append(row)
+            continue
+        _, size, mtime_ns, _, _, _, ino = on_disk[path]
+        report.changed += 1
+        if row["status"] == "missing":
+            report.returned += 1
+        updates.append(("UPDATE files SET size=?, mtime_ns=?, fp=?, ino=?, full_hash=NULL, exif_done=0,"
+                        " status='present', last_seen=? WHERE id=?", (size, mtime_ns, fps.pop(path), ino, scan_id, row["id"])))
+    for row in vacated:                      # its file may be somewhere else now (two files swapped names, say)
+        pool[row["fp"]].append(row)
+
     inserts: list[tuple] = []
-    for i, path in enumerate(new_paths):
+    moves: dict[str, tuple[str, int]] = {}   # old path -> (new path, its update)
+    places = [p for p in rewritten if p in found or p in fps] + new_paths
+    for i, path in enumerate(places):
         if progress and i % 25 == 0:
-            progress("fingerprinting new files", i, len(new_paths))
+            progress("fingerprinting new files", i, len(places))
         root_id, size, mtime_ns, ext, kind, _, ino = on_disk[path]
         old = found.get(path)
         if old is None:
-            try:
-                fp = quick_fp(path, size)
-            except OSError as e:
-                report.errors.append(f"{path}: {e}")
-                continue
-            if pool.get(fp):
-                # Identical copies: the one with this file's name is the one that moved.
-                name = os.path.basename(path)
-                k = next((j for j, r in enumerate(pool[fp]) if os.path.basename(r["path"]) == name), 0)
-                old = pool[fp].pop(k)
+            fp = fps.get(path)
+            if fp is None:
+                try:
+                    fp = quick_fp(path, size)
+                except OSError as e:
+                    report.errors.append(f"{path}: {e}")
+                    continue
+            old = _take(pool, fp, path, ino)
         if old is not None:
             report.moved += 1
+            moves[old["path"]] = (path, len(updates))
             updates.append(("UPDATE files SET path=?, root_id=?, size=?, mtime_ns=?, ino=?, status='present', last_seen=?"
                             " WHERE id=?", (path, root_id, size, mtime_ns, ino, scan_id, old["id"])))
         else:
@@ -352,8 +563,23 @@ def scan(conn, progress: Callable[[str, int, int], None] | None = None) -> ScanR
             if row["status"] != "missing":
                 report.missing += 1
                 updates.append(("UPDATE files SET status='missing' WHERE id=?", (row["id"],)))
+    # Out of the way first (to a name no photo file can have, in the same folder), before anything takes
+    # their places; then each goes where its file went, or stays missing.
+    first = [("UPDATE files SET path=? WHERE id=?", (_vacated_path(r), r["id"])) for r in vacated]
+    updates = first + updates
+    renamed = _folders_renamed({o: n for o, (n, _) in moves.items()}, db_files, on_disk, report.roots_scanned)
 
     # ---- phase 2: write, in short transactions
+    for a, b in renamed:
+        # A folder renamed or moved in Finder: its files, and everything kept by its path (your names for
+        # folders, which copies to keep, selections, albums and smart albums), in one transaction.
+        for o, (_, k) in moves.items():
+            if volumes.moved_path(o, a, b):
+                conn.execute(*updates[len(first) + k])
+                updates[len(first) + k] = None
+        volumes.rewrite_paths(conn, a, b)
+        conn.commit()
+    updates = [u for u in updates if u is not None]
     for i in range(0, len(updates), WRITE_BATCH):
         for sql, args in updates[i : i + WRITE_BATCH]:
             conn.execute(sql, args)
@@ -499,20 +725,37 @@ def _pair_shots(conn) -> set[int]:
                 while dst in merged_into and merged_into[dst] != o:
                     dst = merged_into[dst]
                 _merge_shot_data(conn, o, dst)
-        db.forget_computed(conn, orphans)
-        q = ",".join("?" * len(orphans))
-        conn.execute(f"DELETE FROM decisions WHERE shot_id IN ({q})", orphans)
-        conn.execute(f"DELETE FROM shot_keywords WHERE shot_id IN ({q})", orphans)
-        conn.execute(f"DELETE FROM shots WHERE id IN ({q})", orphans)
+        _forget_shots(conn, orphans)
     conn.commit()
     return touched - set(orphans)
 
 
+def _forget_shots(conn, ids: list[int]) -> None:
+    """Photos leaving the catalog, with what was computed about them and what you made: decisions,
+    keywords, RAW choices, dates given by hand and time shifts (db.MADE_PER_PHOTO). Their history
+    stays. The caller commits."""
+    db.forget_computed(conn, ids)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for i in range(0, len(ids), 500):
+        chunk = [int(x) for x in ids[i : i + 500]]
+        q = ",".join("?" * len(chunk))
+        for t in (*db.MADE_PER_PHOTO, "shot_keywords"):
+            if t in tables:
+                conn.execute(f"DELETE FROM {t} WHERE shot_id IN ({q})", chunk)
+        conn.execute(f"DELETE FROM shots WHERE id IN ({q})", chunk)
+
+
+# What you made about a photo, one row each, kept by the newer when two photos join (this column says when).
+_NEWER_BY = {"raw_choices": "updated", "manual_dates": "set_at", "shot_offsets": "set_at"}
+
+
 def _merge_shot_data(conn, src: int, dst: int) -> None:
     """Two shots became one (a RAW joined its JPEG, say). Everything you made about the one going
-    away moves to the one that stays: stars and picks, keywords, comments, favourites, album places,
-    history and the names on its faces. When both had a decision, the newer one is kept and the other
-    is written to the history, so Undo brings it back."""
+    away moves to the one that stays: stars and picks, RAW choices, dates given by hand and time
+    shifts, keywords, comments, favourites, album places, history and the names on its faces (and its
+    files' backups and share links follow). When both had a decision, the newer one is kept and the
+    other is written to the history, so Undo brings it back; of two RAW choices, dates or shifts, the
+    newer one is kept."""
     import json as _json
 
     cols = "rating, pick, label, updated_at"
@@ -542,6 +785,21 @@ def _merge_shot_data(conn, src: int, dst: int) -> None:
     conn.execute("DELETE FROM viewer_decisions WHERE shot_id=?", (src,))
     conn.execute("UPDATE album_items SET shot_id=? WHERE shot_id=?", (dst, src))
     conn.execute("UPDATE decision_log SET shot_id=? WHERE shot_id=?", (dst, src))
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for t, when in _NEWER_BY.items():
+        if t not in tables:
+            continue
+        a = conn.execute(f"SELECT {when} FROM {t} WHERE shot_id=?", (src,)).fetchone()
+        b = conn.execute(f"SELECT {when} FROM {t} WHERE shot_id=?", (dst,)).fetchone()
+        if a and (not b or (a[0] or 0) > (b[0] or 0)):
+            conn.execute(f"DELETE FROM {t} WHERE shot_id=?", (dst,))
+            conn.execute(f"UPDATE {t} SET shot_id=? WHERE shot_id=?", (dst, src))
+        conn.execute(f"DELETE FROM {t} WHERE shot_id=?", (src,))
+    if "backups" in tables:                  # kept by file: the files joined the photo that stays
+        conn.execute("UPDATE backups SET shot_id=? WHERE shot_id=?", (dst, src))
+    if "share_photos" in tables:
+        conn.execute("UPDATE OR IGNORE share_photos SET shot_id=? WHERE shot_id=?", (dst, src))
+        conn.execute("DELETE FROM share_photos WHERE shot_id=?", (src,))
     from .smart import carry_shot_tags
 
     carry_shot_tags(conn, src, dst)
@@ -609,7 +867,10 @@ def _summarize_shots(conn, shot_ids: set[int]) -> None:
                 old = conn.execute("SELECT capture_ts, camera, body_serial FROM shots WHERE id=?", (sid,)).fetchone()
                 if old and old["capture_ts"] is not None:
                     vals.update(capture_ts=old["capture_ts"], camera=old["camera"], body_serial=old["body_serial"])
-            if vals.get("capture_ts") is not None:
+            own = info is not None and info.get("capture_ts") is not None
+            if own and sid in given:                 # its file carries a date of its own now, which wins: yours goes
+                conn.execute("DELETE FROM manual_dates WHERE shot_id=?", (sid,))
+            if vals.get("capture_ts") is not None and (own or sid not in given):
                 off = offsets.get(camera_key(vals.get("camera"), vals.get("body_serial")), 0.0) + shot_shift.get(sid, 0.0)
                 vals["eff_ts"], vals["time_src"] = vals["capture_ts"] + off, "exif"
             elif sid in given:                       # no date of its own, but you gave it one
@@ -625,12 +886,14 @@ def _summarize_shots(conn, shot_ids: set[int]) -> None:
 
 
 def apply_offsets(conn) -> int:
-    """Recompute the shared timeline after a camera clock correction changed."""
+    """Recompute the shared timeline after a camera clock correction changed. A date you gave by hand
+    is the time itself, so no camera's correction moves it."""
     from .grouping import camera_key
 
     offsets = {r[0]: r[1] for r in conn.execute("SELECT camera_key, offset_s FROM camera_offsets")}
     shifted = dating.shifts(conn)                  # a photo's own shift stays on top of its camera's correction
-    rows = conn.execute("SELECT id, capture_ts, camera, body_serial FROM shots WHERE capture_ts IS NOT NULL").fetchall()
+    rows = conn.execute("SELECT id, capture_ts, camera, body_serial FROM shots WHERE capture_ts IS NOT NULL"
+                        " AND time_src IS NOT 'manual'").fetchall()
     conn.executemany("UPDATE shots SET eff_ts=? WHERE id=?",
                      [(r["capture_ts"] + offsets.get(camera_key(r["camera"], r["body_serial"]), 0.0) + shifted.get(r["id"], 0.0), r["id"])
                       for r in rows])
@@ -649,13 +912,7 @@ def remove_root(conn, root_id: int) -> None:
 def prune_missing(conn, project: str | None = None) -> int:
     """Forget photos missing from disk, with their ratings. Catalog only; touches no files."""
     ids = [r[0] for r in conn.execute("SELECT id FROM shots WHERE status='missing'")]
-    db.forget_computed(conn, ids)
-    for i in range(0, len(ids), 500):
-        chunk = ids[i : i + 500]
-        q = ",".join("?" * len(chunk))
-        conn.execute(f"DELETE FROM decisions WHERE shot_id IN ({q})", chunk)
-        conn.execute(f"DELETE FROM shot_keywords WHERE shot_id IN ({q})", chunk)
-        conn.execute(f"DELETE FROM shots WHERE id IN ({q})", chunk)
+    _forget_shots(conn, ids)
     conn.execute("DELETE FROM files WHERE status='missing'")
     conn.commit()
     if project:

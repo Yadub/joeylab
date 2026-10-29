@@ -3,7 +3,10 @@ plus the LAION aesthetic predictor. Runs locally (Apple GPU via MPS when availab
 
 from __future__ import annotations
 
+import gc
+import sys
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -30,40 +33,56 @@ CREATE INDEX IF NOT EXISTS embeddings_shot ON embeddings(shot_id);     -- counte
 
 
 def available() -> bool:
-    try:
-        import open_clip  # noqa: F401
-        import torch  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    """Whether the AI extra is installed, without importing it (torch takes seconds to import: the
+    first page after a restart used to wait for it)."""
+    from importlib.util import find_spec
+
+    return all(find_spec(m) is not None for m in ("open_clip", "torch"))
 
 
 _LOCK = threading.RLock()        # loading the model; the loaded one is shared by web requests and background jobs
-_MATRIX: dict[str, tuple] = {}   # db file -> (stamp, ids, matrix) for fast repeated searches
+IDLE_S = 600.0                   # the model and the vectors kept in memory are let go after this long unused
 
 
 class Models:
+    """CLIP, loaded when something needs it and let go when it has been idle for IDLE_S (the service
+    runs for weeks; once a library has a picture-search index, only updates with new photos need it).
+    text_only: for searches and words only: the text half, at half precision on the graphics
+    processor (its text vectors match full precision's to five decimal places), about a fifth of the
+    memory. A photo to embed loads the whole model at full precision, as the stored vectors were made."""
+
     _inst: "Models | None" = None
     _cpu_only = False                # the graphics processor stopped answering once: the CPU from then on
 
-    def __init__(self):
+    def __init__(self, text_only: bool = False):
         import open_clip
         import torch
 
         self.torch = torch
         self.lock = threading.RLock()
+        self.text_only = text_only
+        self.used = time.monotonic()
         self.device = "mps" if torch.backends.mps.is_available() and not Models._cpu_only else "cpu"
-        self.model, _, self.preprocess = config.offline_first(lambda: open_clip.create_model_and_transforms(CLIP_ARCH, pretrained=CLIP_PRETRAINED))
-        self.model = self.model.to(self.device).eval()
+        model, _, self.preprocess = config.offline_first(lambda: open_clip.create_model_and_transforms(CLIP_ARCH, pretrained=CLIP_PRETRAINED))
+        self.dtype = torch.float16 if text_only and self.device == "mps" else torch.float32
+        if text_only:
+            model.visual = None
+        self.model = model.to(dtype=self.dtype).to(self.device).eval()     # cast here: no full-size copy on the GPU
         self.tokenizer = config.offline_first(lambda: open_clip.get_tokenizer(CLIP_ARCH))
-        self.aesthetic = self._load_aesthetic()
+        self.aesthetic = None if text_only else self._load_aesthetic()
 
     @classmethod
-    def get(cls) -> "Models":
+    def get(cls, text_only: bool = False) -> "Models":
+        """The loaded model, or a new one. Asked for photos while only the text half is loaded, it
+        loads the whole model in its place."""
         with _LOCK:
-            if cls._inst is None:
-                cls._inst = Models()
-            return cls._inst
+            inst = cls._inst
+            if inst is None or (getattr(inst, "text_only", False) and not text_only):
+                cls._inst = inst = None            # the text half goes before the whole model loads
+                inst = cls._inst = Models(text_only)
+                _watch_idle()
+            inst.used = time.monotonic()
+            return inst
 
     @classmethod
     def loaded(cls) -> bool:
@@ -92,7 +111,10 @@ class Models:
         return mlp.to(self.device).eval()
 
     def embed_images(self, images) -> tuple[np.ndarray, np.ndarray]:
+        if self.text_only:
+            raise RuntimeError("This copy of the picture model has only its text half: use Models.get()")
         torch = self.torch
+        self.used = time.monotonic()
         with self.lock, torch.no_grad():
             x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
             e = self.model.encode_image(x).float()
@@ -102,10 +124,91 @@ class Models:
 
     def embed_text(self, text: str) -> np.ndarray:
         torch = self.torch
+        self.used = time.monotonic()
         with self.lock, torch.no_grad():
             t = self.model.encode_text(self.tokenizer([text]).to(self.device)).float()
             t = t / t.norm(dim=-1, keepdim=True)
         return t.cpu().numpy()[0]
+
+
+_VECS: dict[str, tuple] = {}     # db file -> (stamp, ids, float32 matrix, {photo id: its row}, last used)
+_WATCHING = False
+
+
+def _watch_idle() -> None:
+    """Start the thread that lets go of what's idle, unless it's running. (Call holding _LOCK.)"""
+    global _WATCHING
+    if not _WATCHING:
+        _WATCHING = True
+        threading.Thread(target=_idle_loop, name="ai-idle", daemon=True).start()
+
+
+def _idle_loop() -> None:
+    global _WATCHING
+    while True:
+        time.sleep(min(60.0, IDLE_S / 4))
+        release_idle()
+        with _LOCK:
+            if Models._inst is None and not _VECS:
+                _WATCHING = False
+                return
+
+
+def release_idle(idle_s: float | None = None) -> bool:
+    """Let go of the model and the vectors kept in memory when nothing has used them for idle_s
+    (IDLE_S). A model in use is never let go. True when anything was."""
+    idle_s = IDLE_S if idle_s is None else idle_s
+    now = time.monotonic()
+    gone = False
+    with _LOCK:
+        inst = Models._inst
+        if inst is not None and now - inst.used >= idle_s and inst.lock.acquire(blocking=False):
+            Models._inst = None
+            inst.lock.release()
+            gone = True
+        for k in [k for k, v in _VECS.items() if now - v[4] >= idle_s]:
+            del _VECS[k]
+            gone = True
+    if gone:
+        inst = None
+        gc.collect()
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    return gone
+
+
+def search_needs_model() -> bool:
+    """Whether a search could need CLIP: a library has its vectors but no picture-search index (or
+    picture search isn't installed), so its searches fall back to them. Otherwise the service has no
+    reason to load CLIP until an update has new photos to embed."""
+    from . import search
+
+    for name in config.list_projects():
+        try:
+            conn = db.connect(name, create=False)
+        except Exception:
+            continue
+        try:
+            if _has_rows(conn, "embeddings") and not (search.available() and _has_rows(conn, "search_vecs")):
+                return True
+        finally:
+            conn.close()
+    return False
+
+
+def _has_rows(conn, table: str) -> bool:
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone())
+
+
+def warm_up() -> None:
+    """At the service's start: load CLIP's text half only when a library's searches would use it."""
+    try:
+        if search_needs_model():
+            Models.get(text_only=True).embed_text("a photo")
+    except Exception:
+        pass
 
 
 def ensure_schema(conn) -> None:
@@ -168,49 +271,52 @@ def run(conn, batch: int = 32, progress: Callable[[int, int], None] | None = Non
     return done
 
 
-_LOADED: dict[str, tuple] = {}
+def _vectors(conn) -> tuple | None:
+    """(ids, float32 matrix, {photo id: its row}) for present photos' current CLIP vectors, held once
+    (the rows are views into the matrix) and kept until they change or go unused for IDLE_S."""
+    try:
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+        stamp = (db.counter(conn, "emb_gen"), *conn.execute(
+            "SELECT COUNT(*), (SELECT COUNT(*) FROM shots WHERE status='present') FROM embeddings").fetchone())
+    except Exception:
+        return None
+    with _LOCK:
+        hit = _VECS.get(db_file)
+        if hit and hit[0] == stamp:
+            _VECS[db_file] = (*hit[:4], time.monotonic())
+            return hit[1:4]
+    rows = conn.execute(
+        "SELECT e.shot_id, e.vec FROM embeddings e JOIN shots s ON s.id=e.shot_id"
+        " WHERE s.status='present' AND e.model=? AND e.src = s.analyzed_fp", (MODEL_TAG,)
+    ).fetchall()
+    if rows:
+        rows = [r for r in rows if len(r[1]) == len(rows[0][1])]
+    if not rows:
+        return None
+    ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+    mat = np.empty((len(rows), len(rows[0][1]) // 2), dtype=np.float32)
+    for k, r in enumerate(rows):
+        mat[k] = np.frombuffer(r[1], dtype=np.float16)
+    del rows
+    by_id = {int(sid): mat[k] for k, sid in enumerate(ids)}
+    with _LOCK:
+        _VECS.clear()            # one catalog at a time is plenty: keeps memory bounded
+        _VECS[db_file] = (stamp, ids, mat, by_id, time.monotonic())
+        _watch_idle()
+    return ids, mat, by_id
 
 
 def load_embeddings(conn) -> dict[int, np.ndarray]:
     """CLIP vectors of present photos, cached per catalog until they change (grouping, scoring and
     search used to load them separately on every run)."""
-    try:
-        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-        stamp = (db.counter(conn, "emb_gen"), conn.execute("SELECT COUNT(*) FROM shots WHERE status='present'").fetchone()[0],
-                 conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
-    except Exception:
-        return {}
-    hit = _LOADED.get(db_file)
-    if hit and hit[0] == stamp:
-        return hit[1]
-    rows = conn.execute(
-        "SELECT e.shot_id, e.vec FROM embeddings e JOIN shots s ON s.id=e.shot_id"
-        " WHERE s.status='present' AND e.model=? AND e.src = s.analyzed_fp", (MODEL_TAG,)
-    ).fetchall()
-    out = {r[0]: np.frombuffer(r[1], dtype=np.float16).astype(np.float32) for r in rows}
-    _LOADED.clear()          # one catalog at a time is plenty: keeps memory bounded
-    _LOADED[db_file] = (stamp, out)
-    return out
+    v = _vectors(conn)
+    return v[2] if v else {}
 
 
 def _matrix(conn) -> tuple[np.ndarray, np.ndarray] | None:
-    """All current embeddings as (ids, matrix), cached until the embeddings table changes."""
-    try:
-        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
-        stamp = (db.counter(conn, "emb_gen"),) + tuple(conn.execute(
-            "SELECT COUNT(*), (SELECT COUNT(*) FROM shots WHERE status='present') FROM embeddings e").fetchone())
-    except Exception:
-        return None
-    hit = _MATRIX.get(db_file)
-    if hit and hit[0] == tuple(stamp):
-        return hit[1], hit[2]
-    embs = load_embeddings(conn)
-    if not embs:
-        return None
-    ids = np.array(list(embs.keys()))
-    mat = np.stack(list(embs.values()))
-    _MATRIX[db_file] = (tuple(stamp), ids, mat)
-    return ids, mat
+    """All current embeddings as (ids, matrix): the same memory as load_embeddings."""
+    v = _vectors(conn)
+    return (v[0], v[1]) if v else None
 
 
 def search(conn, text: str, limit: int = 30) -> list[tuple[int, float]]:
@@ -218,7 +324,7 @@ def search(conn, text: str, limit: int = 30) -> list[tuple[int, float]]:
     if m is None:
         return []
     ids, mat = m
-    sims = mat @ Models.get().embed_text(text)
+    sims = mat @ Models.get(text_only=True).embed_text(text)
     order = np.argsort(-sims)[:limit]
     return [(int(ids[i]), float(sims[i])) for i in order]
 

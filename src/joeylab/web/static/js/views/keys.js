@@ -55,7 +55,7 @@ const PEOPLE = [
   ["Esc, then S / X", "On a face group's card: hide it as strangers / not a face"], ["Enter", "On a face group's card: name it"],
 ];
 const COMPARE = [
-  ["1 – 6 / ← →", "Highlight a photo"], ["P / X", "Pick / reject the highlighted photo"],
+  ["1 – 6 / ← →", "Highlight a photo"], ["P / X", "Pick / reject the highlighted photo"], ["0", "Clear its pick or reject and stars"],
   ["Space", "Open the highlighted photo"], ["Enter", "Keep the highlighted one, reject the others"], ["Esc", "Close"],
 ];
 const MAPS = [
@@ -98,7 +98,7 @@ function current() {
 }
 
 // A page's own list (its `keys`, by name) takes the place of the copy here.
-const OWN = { Cull: "cull", Duplicates: "dupes", Events: "events" };
+const OWN = { Cull: "cull", Duplicates: "dupes", Events: "events", Compare: "compare" };
 
 /** The shortcuts, by page. `own` ({name, rows}) is the open page's own list (Cull, Duplicates and
  * Events hand theirs over). */
@@ -129,7 +129,7 @@ export function keysDialog(own) {
   };
   const mine = OWN[own?.name];
   if (mine && own.rows?.length) groups[mine][1] = own.rows.filter(([k]) => !/^(U\b|\?)/.test(k));   // (undo and ? are under Everywhere)
-  const order = [here, "cull", "viewer", "grid", "compare", "dupes", "events", "people", "maps", "history"]
+  const order = [mine === "compare" ? "compare" : here, "cull", "viewer", "grid", "compare", "dupes", "events", "people", "maps", "history"]
     .filter((k, i, a) => groups[k] && a.indexOf(k) === i);
   atTop(dialog("Keyboard shortcuts", h("div", { class: "stack-v keys-dialog" },
     order.map((k) => section(groups[k])), section(["Everywhere", EVERYWHERE])), [{ label: "Close", primary: true }]));

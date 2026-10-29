@@ -461,18 +461,25 @@ def store_town(conn, place_id: int) -> bool:
 
 def assign(conn, log: Callable[[str], None] = print, download: bool = True) -> dict:
     """Name the place of every photo with GPS, then infer it for photos taken nearby in time.
-    A place you set yourself is kept."""
+    A place you set yourself is kept. Only photos whose place changes are written (rewriting every
+    photo's held the catalog's write lock through the whole of it, every update)."""
     if not (available() or (download and ensure(log))):
         return {"gps": 0, "inferred": 0, "available": False}
     g = Gazetteer.get()
-    gps = conn.execute("SELECT id, gps_lat, gps_lon, eff_ts FROM shots WHERE status='present' AND gps_lat IS NOT NULL").fetchall()
+    gps = conn.execute("SELECT id, gps_lat, gps_lon, eff_ts, place_id, place_src FROM shots"
+                       " WHERE status='present' AND gps_lat IS NOT NULL").fetchall()
+    stored = {r[0] for r in conn.execute("SELECT id FROM places")}
     n_gps = 0
     timeline: list[tuple[float, int]] = []
     updates = []
     for r in gps:
         hit = g.nearest(r["gps_lat"], r["gps_lon"])
-        pid = _store_place(conn, hit[0]) if hit else None
-        updates.append((pid, "gps" if pid else None, r["id"]))
+        pid = None
+        if hit:
+            pid = hit[0][0] if hit[0][0] in stored else _store_place(conn, hit[0])
+            stored.add(pid)
+        if (pid, "gps" if pid else None) != (r["place_id"], r["place_src"]):
+            updates.append((pid, "gps" if pid else None, r["id"]))
         if pid:
             n_gps += 1
             if r["eff_ts"] is not None:
@@ -480,9 +487,10 @@ def assign(conn, log: Callable[[str], None] = print, download: bool = True) -> d
     conn.executemany("UPDATE shots SET place_id=?, place_src=? WHERE id=?", updates)
     timeline.sort()
     times = [t for t, _ in timeline]
-    inferred = []
-    for r in conn.execute("SELECT id, eff_ts FROM shots WHERE status='present' AND gps_lat IS NULL AND eff_ts IS NOT NULL"
-                          " AND COALESCE(time_src, 'exif') = 'exif' AND COALESCE(place_src, '') != 'manual'"):
+    inferred, n_inferred = [], 0
+    for r in conn.execute("SELECT id, eff_ts, place_id, place_src FROM shots WHERE status='present' AND gps_lat IS NULL"
+                          " AND eff_ts IS NOT NULL AND COALESCE(time_src, 'exif') = 'exif' AND COALESCE(place_src, '') != 'manual'"
+                          ).fetchall():
         pid = None
         if times:
             i = bisect.bisect_left(times, r["eff_ts"])
@@ -490,10 +498,12 @@ def assign(conn, log: Callable[[str], None] = print, download: bool = True) -> d
             places = {p for _, p in near}
             if len(places) == 1:
                 pid = places.pop()
-        inferred.append((pid, "inferred" if pid else None, r["id"]))
+        n_inferred += bool(pid)
+        if (pid, "inferred" if pid else None) != (r["place_id"], r["place_src"]):
+            inferred.append((pid, "inferred" if pid else None, r["id"]))
     conn.executemany("UPDATE shots SET place_id=?, place_src=? WHERE id=?", inferred)
     conn.commit()
-    return {"gps": n_gps, "inferred": sum(1 for p, _, _ in inferred if p), "available": True}
+    return {"gps": n_gps, "inferred": n_inferred, "available": True}
 
 
 def summary(conn) -> list[dict]:

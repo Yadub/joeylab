@@ -1,6 +1,7 @@
 """People and pets: naming face groups fast (merge suggestions, a keyboard naming stream),
 hiding strangers, coverage, who appears together, face-by-face comparison within a burst, and
-forgetting face data."""
+forgetting face data. Pets (pets.py) are rows in faces of kind 'pet', grouped and named the same way
+and listed apart."""
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import numpy as np
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ... import aliases, db, faces as faces_mod, identity, library
+from ... import aliases, db, faces as faces_mod, identity, library, pets as pets_mod, scoring
 from ..deps import conn_dep, is_owner, one, require_owner, require_writer, viewer_of
 
 router = APIRouter()
@@ -25,6 +26,7 @@ GROUPED_UNNAMED = "f.cluster IS NOT NULL AND (+f.person_id IS NULL OR +f.person_
 # side of 'present' is a range of the status index; != would read all of it.)
 PRESENT = "f.shot_id NOT IN (SELECT id FROM shots WHERE status < 'present' OR status > 'present')"
 STRANGERS = "Strangers"
+OTHER_ANIMALS = "Other animals"
 
 
 def _cover(conn, where: str, args) -> int | None:
@@ -69,38 +71,51 @@ def api_people(p: str, request: Request, min_photos: int = 2, limit: int = 60, c
                 "last": st["last"], "cover": _cover(conn, "f.person_id=?", (pe["id"],))}
         (hidden if pe["hidden"] else people).append(item)
     groups, unclear_out, clear, small = [], [], [], 0
+    pet_groups, pet_all, pet_small = [], [], 0
     if limit > 0:
         # Groups still to name, biggest first; "unclear faces" (a mix of blurred, turned and partial faces,
         # not one person) are set aside so they don't lead the list. One pass over the groups gives both
-        # the ones shown and how many smaller ones there are.
+        # the ones shown and how many smaller ones there are. Pets' groups are listed on their own.
         unclear = faces_mod.unclear_groups(conn)
+        of_pets = pets_mod.groups(conn)
         bar = max(1, min_photos)
         all_groups, small = [], 0
         for r in conn.execute(f"SELECT f.cluster, COUNT(DISTINCT f.shot_id) AS photos, COUNT(*) AS faces FROM faces f"
                               f" WHERE {GROUPED_UNNAMED} AND {PRESENT} GROUP BY f.cluster"):
+            pet = r["cluster"] in of_pets
             if r["photos"] >= bar:
-                all_groups.append(dict(r))
+                (pet_all if pet else all_groups).append(dict(r))
+            elif pet:
+                pet_small += 1
             else:
                 small += 1
         all_groups.sort(key=lambda g: -g["photos"])
+        pet_all.sort(key=lambda g: -g["photos"])
         clear = [g for g in all_groups if g["cluster"] not in unclear]
         unclear_list = [g for g in all_groups if g["cluster"] in unclear]
         shown = clear[: max(1, min(int(limit), 5000))]
-        samples = _samples(conn, [g["cluster"] for g in shown + unclear_list])
+        pets_shown = pet_all[: max(1, min(int(limit), 5000))]
+        samples = _samples(conn, [g["cluster"] for g in shown + unclear_list + pets_shown])
         groups = [{**g, "sample": samples.get(g["cluster"], [])} for g in shown]
         unclear_out = [{**g, "sample": samples.get(g["cluster"], [])} for g in unclear_list]
+        pet_groups = [{**g, "sample": samples.get(g["cluster"], [])} for g in pets_shown]
     me = identity.person_id(conn, viewer_of(request))
     people.sort(key=lambda x: x["id"] != me)            # you first
+    found = pets_mod.counts(conn)["pets"]
+    animal_faces = one(conn, "SELECT COUNT(*) FROM faces WHERE kind = 'pet'") - found      # (faces_kind index)
     return {"me": me, "people": [x for x in people if x["kind"] != "pet"], "pets": [x for x in people if x["kind"] == "pet"],
             "hidden": hidden, "groups": groups, "groups_total": len(clear), "unclear": unclear_out, "smaller_groups": small,
-            "faces": one(conn, "SELECT COUNT(*) FROM faces"), "available": faces_mod.available(),
+            "pet_groups": pet_groups, "pet_groups_total": len(pet_all), "smaller_pet_groups": pet_small, "pets_found": found,
+            "pets_available": pets_mod.available(), "animal_faces": animal_faces,
+            "faces": one(conn, "SELECT COUNT(*) FROM faces") - found - animal_faces, "available": faces_mod.available(),
             "enabled": db.get_setting(conn, "faces_enabled", True) and faces_mod.enabled(),
             "recognition": faces_mod.enabled(), "model": faces_mod.current(), "switch": faces_mod.switch_progress(conn),
             "licence_url": faces_mod.MODELS[faces_mod.active()].links[0][1]}
 
 
-def _person_named(conn, name: str, kind: str | None = None, hidden: bool = False) -> int:
-    """The person called this, by their name or one of their other names; someone new otherwise.
+def _person_named(conn, name: str, kind: str | None = None, hidden: bool = False, new_kind: str | None = None) -> int:
+    """The person called this, by their name or one of their other names; someone new otherwise (a
+    `new_kind` one: naming a pets' group makes a pet, but never turns someone you've named into one).
     The look-up and the new person are one write (until the caller commits): two presses of Save
     at once make one person, not two."""
     name = " ".join(name.split())
@@ -113,7 +128,8 @@ def _person_named(conn, name: str, kind: str | None = None, hidden: bool = False
             conn.execute("UPDATE people SET kind=? WHERE id=?", (kind, r[0]))
         return r[0]
     pid = db.new_id(conn, "people")              # never reuse a removed person's id
-    conn.execute("INSERT INTO people(id, name, kind, hidden) VALUES (?, ?, ?, ?)", (pid, name, kind or "person", int(hidden)))
+    conn.execute("INSERT INTO people(id, name, kind, hidden) VALUES (?, ?, ?, ?)",
+                 (pid, name, kind or new_kind or "person", int(hidden)))
     return pid
 
 
@@ -145,7 +161,15 @@ def api_name_group(p: str, request: Request, body: dict = Body(default_factory=d
     background."""
     require_writer(request)
     kind = body.get("kind") if body.get("kind") in ("person", "pet") else None
-    pid = _person_named(conn, body.get("name", ""), kind)
+    pet = False
+    if body.get("cluster") is not None:
+        pet = pets_mod.is_pet_group(conn, int(body["cluster"]))
+        faces_mod.vectors(conn, pets_mod.MODEL if pet else None)   # read before the write lock, if they aren't kept already
+    elif body.get("faces"):                                          # pets named one by one (from the viewer)
+        ids = [int(x) for x in body["faces"]][:900]
+        pet = conn.execute(f"SELECT COUNT(*) FROM faces WHERE model = ? AND id IN ({','.join('?' * len(ids))})",
+                           (pets_mod.MODEL, *ids)).fetchone()[0] == len(ids)
+    pid = _person_named(conn, body.get("name", ""), kind, new_kind="pet" if pet else None)
     aliases.add(conn, pid, [str(x) for x in body.get("aliases") or []])      # (bringing back someone forgotten)
     before = {r[0] for r in conn.execute("SELECT id FROM faces WHERE person_id=?", (pid,))}
     joined = 0
@@ -180,7 +204,9 @@ def api_unname(p: str, pid: int, request: Request, body: dict = Body(default_fac
 def api_ignore_group(p: str, cluster: int, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
     """Strangers, or not a face at all: the group leaves the naming list (and coverage) for good."""
     require_writer(request)
-    pid = _person_named(conn, body.get("as") or STRANGERS, hidden=True)
+    pet = pets_mod.is_pet_group(conn, cluster)
+    pid = _person_named(conn, body.get("as") or (OTHER_ANIMALS if pet else STRANGERS), hidden=True,
+                        new_kind="pet" if pet else None)
     conn.execute("UPDATE people SET hidden=1 WHERE id=?", (pid,))
     conn.execute(f"UPDATE faces SET person_id=?, person_src='user' WHERE cluster=? AND {UNNAMED.replace('f.', '')}",
                  (pid, cluster))
@@ -312,6 +338,7 @@ def api_forget_person(p: str, pid: int, request: Request, conn=Depends(conn_dep)
     """Take a name off every face. Returns the faces and name, so the app can offer Undo (naming
     those faces again)."""
     require_writer(request)
+    db.write_lock(conn)                                # the faces Undo names again are the faces taken off
     person = conn.execute("SELECT name, kind FROM people WHERE id=?", (pid,)).fetchone()
     if not person:
         raise HTTPException(404, "No such person.")
@@ -342,12 +369,36 @@ def api_unassign(p: str, fid: int, request: Request, conn=Depends(conn_dep)):
     return {"ok": True}
 
 
-def _centres(conn) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+@router.get("/api/p/{p}/people/animal-faces")
+def api_animal_faces(p: str, limit: int = 200, conn=Depends(conn_dep)):
+    """Faces the face models found on a dog or cat where nobody is, set aside from people's (pets.py),
+    newest first, so any that is a person's can be put back."""
+    faces, total = pets_mod.taken_for_people(conn, max(1, min(int(limit), 2000)))
+    return {"faces": faces, "total": total}
+
+
+@router.post("/api/p/{p}/faces/kind")
+def api_face_kind(p: str, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
+    """{faces, kind}: "person" puts faces set aside as an animal's back among people's, for good; "pet"
+    sets them aside again (Undo). Faces you named are left as they are."""
+    require_writer(request)
+    if body.get("kind") not in ("person", "pet"):
+        raise HTTPException(400, "kind is person or pet.")
+    try:
+        ids = [int(x) for x in body.get("faces") or []]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Say which faces.")
+    n = pets_mod.set_kind(conn, ids, body["kind"])
+    request.app.state.bg.recluster(p)
+    return {"changed": n}
+
+
+def _centres(conn, pet: bool = False) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     """The unit centre of each named person's faces (those you named) and of each unnamed group's, in
     photos in the library, from the faces the chosen models found (other models' vectors can't be
-    compared with them). The vectors are kept in memory (faces_mod.vectors); who each face is, is read
-    fresh."""
-    ids, vecs = faces_mod.vectors(conn)
+    compared with them), or with `pet`, from pets' own vectors. The vectors are kept in memory
+    (faces_mod.vectors); who each face is, is read fresh."""
+    ids, vecs = pets_mod.vectors(conn) if pet else faces_mod.vectors(conn)
     a = faces_mod.assignments(conn)
     at = faces_mod.rows_of(ids, a["id"])
     out = []
@@ -359,24 +410,16 @@ def _centres(conn) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
     return out[0], out[1]
 
 
-@router.get("/api/p/{p}/people/suggestions")
-def api_name_suggestions(p: str, limit: int = 40, conn=Depends(conn_dep)):
-    """"Is this Alex?": unnamed groups whose faces look like someone you've named, closest first.
-    Includes the less certain matches a full re-grouping wouldn't merge on its own (children
-    growing up, glasses, beards). Ranked first; faces and covers are fetched only for those shown."""
-    if not conn.execute("SELECT 1 FROM faces WHERE person_id > 0 AND person_src = 'user' LIMIT 1").fetchone():
-        return {"suggestions": []}                       # nobody named yet: nothing to compare with
-    people, groups = _centres(conn)
-    if not people:
-        return {"suggestions": []}
-    names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM people WHERE COALESCE(hidden,0)=0")}
+def _suggest(conn, names: dict[int, str], pet: bool, limit: int) -> list[dict]:
+    """"Is this …?" for people's groups, or for pets' (each compared only with its own kind of vectors)."""
+    people, groups = _centres(conn, pet)
     pids = [k for k in people if k in names]
     if not pids:
-        return {"suggestions": []}
-    unclear = faces_mod.unclear_groups(conn)
+        return []
+    unclear = set() if pet else faces_mod.unclear_groups(conn)
     cids = [c for c in groups if c not in unclear]
     if not cids:
-        return {"suggestions": []}
+        return []
     sims = np.stack([groups[c] for c in cids]) @ np.stack([people[k] for k in pids]).T
     # A group you've said isn't someone is never suggested as them again.
     col, row = {k: j for j, k in enumerate(pids)}, {c: i for i, c in enumerate(cids)}
@@ -387,7 +430,8 @@ def api_name_suggestions(p: str, limit: int = 40, conn=Depends(conn_dep)):
     score = sims[np.arange(len(cids)), best]
     sizes = {r[0]: r[1] for r in conn.execute(
         f"SELECT f.cluster, COUNT(DISTINCT f.shot_id) FROM faces f WHERE {GROUPED_UNNAMED} GROUP BY f.cluster")}
-    bar = faces_mod.limits()["suggest"]
+    lim = faces_mod.limits(pets_mod.MODEL if pet else None)
+    bar = lim["suggest"]
     ranked = sorted((i for i in range(len(cids)) if score[i] >= bar), key=lambda i: (-score[i], -sizes.get(cids[i], 0)))
     top = ranked[: max(1, min(int(limit), 200))]
     samples = _samples(conn, [cids[i] for i in top], 8)
@@ -395,14 +439,31 @@ def api_name_suggestions(p: str, limit: int = 40, conn=Depends(conn_dep)):
     out = []
     for i in top:
         pid = pids[int(best[i])]
-        if pid not in theirs:          # the named person's clearest faces, to compare with
+        if pid not in theirs:          # the named person's (or pet's) clearest faces, to compare with
             theirs[pid] = [r[0] for r in conn.execute(
-                f"SELECT f.id FROM faces f WHERE {PRESENT} AND f.person_id=?"
-                " ORDER BY COALESCE(f.closed,0), f.px * MIN(f.sharp, 400) DESC LIMIT 4", (pid,))]
-        out.append({"cluster": cids[i], "person": pid, "name": names[pid], "similarity": round(float(score[i]), 3),
+                f"SELECT f.id FROM faces f WHERE {PRESENT} AND f.person_id=?" + (" AND f.model = ?" if pet else "")
+                + " ORDER BY COALESCE(f.closed,0), f.px * MIN(f.sharp, 400) DESC LIMIT 4",
+                (pid, pets_mod.MODEL) if pet else (pid,))]
+        sim = float(score[i])
+        out.append({"cluster": cids[i], "person": pid, "name": names[pid], "similarity": round(sim, 3),
+                    "kind": "pet" if pet else "person",
+                    # How sure, in the bars of these vectors: as close as a merge needs, half way there, or less.
+                    "likely": "very" if sim >= lim["merge"] else "likely" if sim >= (bar + lim["merge"]) / 2 else "possibly",
                     "photos": sizes.get(cids[i], 0), "sample": samples.get(cids[i], []),
                     "person_faces": theirs[pid], "person_cover": (theirs[pid] or [None])[0]})
-    return {"suggestions": out}
+    return out
+
+
+@router.get("/api/p/{p}/people/suggestions")
+def api_name_suggestions(p: str, limit: int = 40, conn=Depends(conn_dep)):
+    """"Is this Alex?": unnamed groups whose faces look like someone you've named, closest first.
+    Includes the less certain matches a full re-grouping wouldn't merge on its own (children
+    growing up, glasses, beards). Pets' groups that look like a pet you've named come first (there
+    are few). Ranked first; faces and covers are fetched only for those shown."""
+    if not conn.execute("SELECT 1 FROM faces WHERE person_id > 0 AND person_src = 'user' LIMIT 1").fetchone():
+        return {"suggestions": []}                       # nobody named yet: nothing to compare with
+    names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM people WHERE COALESCE(hidden,0)=0")}
+    return {"suggestions": _suggest(conn, names, True, limit) + _suggest(conn, names, False, limit)}
 
 
 @router.get("/api/p/{p}/people/across-years")
@@ -454,12 +515,14 @@ def api_together(p: str, conn=Depends(conn_dep)):
 @router.delete("/api/p/{p}/faces")
 def api_forget_faces(p: str, request: Request, confirm: str = "", conn=Depends(conn_dep)):
     """Forget every face, name and face crop in this library, and stop looking for faces here.
-    Face vectors are biometric data; this removes them from the catalog completely."""
+    Face vectors are biometric data; this removes them from the catalog completely. Pets go with
+    their names too, and are found again (unnamed) at the next update."""
     require_writer(request)
     if confirm != p:
         raise HTTPException(400, "Type the library's name to confirm.")
     conn.execute("DELETE FROM faces")
     conn.execute("DELETE FROM people")
+    conn.execute("DELETE FROM animals")
     conn.execute("UPDATE shots SET faces_fp=NULL")
     db.set_setting(conn, "faces_enabled", False)
     conn.commit()
@@ -514,17 +577,20 @@ def api_faces_switch(request: Request, body: dict = Body(default_factory=dict)):
 # ------------------------------------------------------------ faces across a burst
 @router.get("/api/p/{p}/compare-faces")
 def api_compare_faces(p: str, ids: str, conn=Depends(conn_dep)):
-    """For frames of one burst: each person's face in every frame, side by side, with eyes,
-    smile and focus, so you can choose the frame where everyone looks good."""
+    """For frames of one burst: each person's face in every frame, side by side, with eyes, smile,
+    focus and how well it's caught (Apple Vision's face capture quality), so you can choose the frame
+    where everyone looks good. Each frame's `look` weighs the last three, capture quality half of it:
+    it only chooses between frames with as many eyes open, and a turned head never decides alone."""
     from ..deps import ids_of
 
     shot_ids = ids_of(ids) or []
     if not shot_ids or len(shot_ids) > 40:
         raise HTTPException(400, "Compare 1 to 40 frames.")
     q = ",".join("?" * len(shot_ids))
-    rows = conn.execute(f"SELECT f.id, f.shot_id, f.x, f.y, f.w, f.px, f.closed, f.smile, f.sharp, f.vec, f.person_id,"
+    rows = conn.execute(f"SELECT f.id, f.shot_id, f.x, f.y, f.w, f.px, f.closed, f.smile, f.sharp, f.quality, f.vec, f.person_id,"
                         f" pe.name FROM faces f LEFT JOIN people pe ON pe.id = f.person_id WHERE f.shot_id IN ({q})"
-                        " AND f.vec IS NOT NULL AND f.model = ? ORDER BY f.px DESC", (*shot_ids, faces_mod.active())).fetchall()
+                        " AND f.vec IS NOT NULL AND f.model = ? AND COALESCE(f.kind, '') != 'pet' ORDER BY f.px DESC",
+                        (*shot_ids, faces_mod.active())).fetchall()
     if not rows:
         return {"people": [], "frames": shot_ids}
     # Track each person across frames: a face joins the track whose face it most resembles.
@@ -551,14 +617,22 @@ def api_compare_faces(p: str, ids: str, conn=Depends(conn_dep)):
         first = next(iter(t["faces"].values()))
         out.append({"name": next((f["name"] for f in t["faces"].values() if f["name"]), None),
                     "faces": {str(sid): {"id": f["id"], "closed": f["closed"], "smile": f["smile"],
-                                         "sharp": round(f["sharp"] or 0, 1), "px": f["px"]}
+                                         "sharp": round(f["sharp"] or 0, 1), "px": f["px"],
+                                         "caught": None if scoring.caught(f["quality"]) is None else round(scoring.caught(f["quality"]), 2)}
                               for sid, f in t["faces"].items()},
                     "x": first["x"]})
-    # Per frame: how many tracked people have open eyes.
+    # Per frame: how many tracked people have open eyes, and how good their faces look.
+    def look(f) -> float | None:
+        parts = [(w, v) for w, v in ((0.5, scoring.caught(f["quality"])), (0.25, f["smile"]),
+                                     (0.25, scoring._ramp(f["sharp"], 1.3, 2.3))) if v is not None]
+        return sum(w * v for w, v in parts) / sum(w for w, _ in parts) if parts else None
+
     score = {}
     for sid in shot_ids:
         fs = [t["faces"].get(sid) for t in tracks[:12]]
         seen = [f for f in fs if f is not None]
+        looks = [x for x in (look(f) for f in seen) if x is not None]
         score[str(sid)] = {"open": sum(1 for f in seen if not f["closed"]), "closed": sum(1 for f in seen if f["closed"]),
-                           "missing": sum(1 for f in fs if f is None)}
+                           "missing": sum(1 for f in fs if f is None),
+                           "look": round(sum(looks) / len(looks), 3) if looks else None}
     return {"people": out, "frames": shot_ids, "score": score, "rows": library.rows_by_ids(conn, shot_ids)}

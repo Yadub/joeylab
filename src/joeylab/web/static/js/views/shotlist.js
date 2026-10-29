@@ -27,8 +27,11 @@ export async function coverDialog(id, { onChange } = {}) {
   let items;
   try { items = (await api(P(p, "/shotlist"))).items; } catch (e) { toast(e.message, { kind: "error" }); return; }
   if (!items.length) {
-    toast("This library has no shot list yet: add the must-have moments on Home.",
-      { action: () => { location.hash = `#/p/${encodeURIComponent(p)}/home`; }, actionLabel: "Home" });
+    // An archive's Home has no shot list: it's a shoot's, so say how to make this library one.
+    const archive = store.settings?.purpose === "archive";
+    toast(archive ? "A shot list is for a shoot, and this library is an archive. To use one, make it a shoot with the button at the top of Home."
+      : "This library has no shot list yet: add the must-have moments on Home.",
+    { action: () => { location.hash = `#/p/${encodeURIComponent(p)}/home${archive ? "" : "?tab=shotlist"}`; }, actionLabel: "Home", ...(archive ? { ms: 8000 } : {}) });
     return;
   }
   const r = row(id) || {};

@@ -29,6 +29,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import sys
 import time
@@ -302,6 +303,29 @@ def _taken_in(conn, folder: str) -> set[str]:
     return out
 
 
+def _stem_key(name: str) -> str:
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _stems_in(conn, folder: str, cache: dict) -> dict[str, set[str]]:
+    """The stems of the files in a folder that aren't sidecars, each with the names that have it
+    (all case-folded): on disk now, and every name the catalog has there (present or missing)."""
+    key = ("stems", folder)
+    if key not in cache:
+        out: dict[str, set[str]] = defaultdict(set)
+        _, other, _ = _index(cache, folder)
+        for names in other.values():
+            for n in names:
+                out[_stem_key(os.path.splitext(n)[0])].add(_stem_key(n))
+        lo, hi = _range(folder)
+        for (p,) in conn.execute("SELECT path FROM files WHERE path >= ? AND path < ?", (lo, hi)):
+            rest = p[len(lo):]
+            if os.sep not in rest:
+                out[_stem_key(os.path.splitext(rest)[0])].add(_stem_key(rest))
+        cache[key] = out
+    return cache[key]
+
+
 def _is_free(path: str, taken: set[str], claimed: set[str], mine: set[str] = frozenset()) -> bool:
     """Nothing has this name now: on disk, in the catalog, or earlier in this plan. `mine`: the
     paths of the files being renamed themselves (a change of case only is fine)."""
@@ -419,9 +443,12 @@ def _renamed(name: str, old_stem: str, new_stem: str) -> str:
     return name
 
 
-def _keep_both(names: list[str], stem: str, folder: str, taken: set, claimed: set) -> list[str] | None:
-    """The first "IMG_1 2", "IMG_1 3"... under which every one of these names is free."""
+def _keep_both(names: list[str], stem: str, folder: str, taken: set, claimed: set,
+               stem_free: Callable[[str], bool] = lambda s: True) -> list[str] | None:
+    """The first "IMG_1 2", "IMG_1 3"... under which every one of these names, and the stem, is free."""
     for k in range(2, 1000):
+        if not stem_free(f"{stem} {k}"):
+            continue
         new = [_renamed(n, stem, f"{stem} {k}") if _renamed(n, stem, f"{stem} {k}") != n else
                _with_suffix(n, k) for n in names]
         if all(_is_free(os.path.join(folder, n), taken, claimed) for n in new):
@@ -470,6 +497,7 @@ def _photo_steps(conn, plan: Plan, ids: list[int], new_stems: dict[int, str] | N
     taken_in: dict[str, set] = {}
     problems: dict[str, str | None] = {}
     claimed: set[str] = set()
+    claimed_stems: set[tuple[str, str]] = set()
     unit = 0
     for sid in ids:
         files, what = by_shot.get(sid), stems.get(sid, f"photo {sid}")
@@ -507,6 +535,15 @@ def _photo_steps(conn, plan: Plan, ids: list[int], new_stems: dict[int, str] | N
             taken = taken - {n.casefold() for n in all_names}
         dst_names = [_renamed(n, old_stem, new_stem) for n in all_names]
         ids_of = {os.path.basename(f["path"]): f["id"] for f in files}
+        own = {_stem_key(n) for n in all_names} if new_stems is not None else set()
+        own |= {_stem_key(os.path.basename(r[0])) for r in conn.execute(        # its own files gone missing there
+            "SELECT path FROM files WHERE shot_id=? AND path >= ? AND path < ?", (sid, *_range(dest)))}
+
+        def stem_free(stem: str, dest: str = dest, own: set = own) -> bool:
+            # Files are made one photo by their stem (scanner._pair_shots), so a stem another photo's
+            # file has (IMG_1.JPG from another camera, beside IMG_1.png) is taken, whatever its extension.
+            k = _stem_key(stem)
+            return (dest, k) not in claimed_stems and not (_stems_in(conn, dest, cache).get(k, set()) - own)
 
         def steps_for(out_names: list[str]) -> list[Step]:
             out = []
@@ -520,17 +557,18 @@ def _photo_steps(conn, plan: Plan, ids: list[int], new_stems: dict[int, str] | N
                                 size=st.st_size, mtime_ns=st.st_mtime_ns, copy=copy))
             return out
 
-        if all(_is_free(os.path.join(dest, d), taken, claimed, mine) for d in dst_names):
+        if stem_free(new_stem) and all(_is_free(os.path.join(dest, d), taken, claimed, mine) for d in dst_names):
             plan.steps += steps_for(dst_names)
             chosen, was_taken = dst_names, False
         else:
-            alt = _keep_both(dst_names, new_stem, dest, taken, claimed)
+            alt = _keep_both(dst_names, new_stem, dest, taken, claimed, stem_free)
             if not alt:
                 plan.skipped.append({"what": what, "why": "every name like it is taken"})
                 continue
             plan.conflicts.append({"name": dst_names[0], "steps": steps_for(alt)})
             chosen, was_taken = alt, True
         claimed.update(os.path.join(dest, d).casefold() for d in chosen)
+        claimed_stems.add((dest, _stem_key(os.path.splitext(chosen[0])[0])))
         if new_stems is not None:
             plan.preview.append({"id": sid, "from": names[0], "to": chosen[0], "taken": was_taken})
         unit += 1
@@ -623,10 +661,28 @@ def _remembered_under(conn, folder: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM files WHERE path >= ? AND path < ? LIMIT 1", (lo, hi)).fetchone())
 
 
-def _folder_source(path: str, rs: list[str]) -> str | None:
+def _given_away(conn, path: str) -> str | None:
+    """Why a folder can't be renamed or moved here because of a folder moved to another library, or
+    None: it is (or is inside) one, or holds one, and that library would lose track of its photos."""
+    pre = path.rstrip(os.sep) + os.sep
+    try:
+        rows = conn.execute("SELECT folder, library FROM excluded_folders ORDER BY folder").fetchall()
+    except sqlite3.OperationalError:          # a catalog read before its upgrade: nothing given away
+        return None
+    for folder, lib in rows:
+        other = f"the library “{lib}”" if lib else "another library"
+        if path == folder or path.startswith(folder.rstrip(os.sep) + os.sep):
+            return f"{path} was moved to {other}, so it belongs to that library now. Rename or move it from there."
+        if folder.startswith(pre):
+            return (f"“{os.path.basename(path)}” holds {folder}, which was moved to {other}. Renaming or moving it "
+                    "would leave that library without those photos, so JoeyLab won't do it.")
+    return None
+
+
+def _folder_source(conn, path: str, rs: list[str]) -> str | None:
     if os.path.isdir(path) and os.path.ismount(path):
         return "That's a whole drive. Rename it in Finder; JoeyLab follows a renamed drive by itself."
-    return _folder_problem(path, rs) or (_writable(os.path.dirname(path)) if os.path.isdir(path) else None)
+    return _given_away(conn, path) or _folder_problem(path, rs) or (_writable(os.path.dirname(path)) if os.path.isdir(path) else None)
 
 
 def plan_rename_folder(conn, project: str, path: str, name: str) -> Plan:
@@ -638,7 +694,7 @@ def plan_rename_folder(conn, project: str, path: str, name: str) -> Plan:
     except Refused as e:
         plan.refused = str(e)
         return plan
-    plan.refused = _folder_source(path, roots(conn))
+    plan.refused = _folder_source(conn, path, roots(conn))
     if plan.refused:
         return plan
     dst = os.path.join(os.path.dirname(path), name)
@@ -705,7 +761,7 @@ def plan_move_folder(conn, project: str, path: str, into: str) -> Plan:
         plan.refused = ("That's one of the library's own folders: it can be renamed where it is, but not moved. "
                         "Move the folders inside it instead.")
         return plan
-    plan.refused = _folder_source(path, rs) or _folder_problem(into, rs, db.excluded_folders(conn))
+    plan.refused = _folder_source(conn, path, rs) or _folder_problem(into, rs, db.excluded_folders(conn))
     if plan.refused:
         return plan
     real_p, real_i = os.path.realpath(path), os.path.realpath(into)
@@ -1328,6 +1384,9 @@ def _follow_back(conn, s: Step) -> None:
         conn.execute("UPDATE files SET path=?, ino=?, size=?, mtime_ns=? WHERE id=?",
                      (s.dst, db.to_i64(st.st_ino), st.st_size, st.st_mtime_ns, s.file_id))
         conn.execute("UPDATE album_items SET source_path=? WHERE source_path=?", (s.dst, s.src))
+        new_root = root_of(s.dst, roots(conn))               # back on the drive it came from, as _follow_file does
+        if new_root and new_root != root_of(s.src, roots(conn)):
+            conn.execute("UPDATE files SET root_id=(SELECT id FROM roots WHERE path=?) WHERE id=?", (new_root, s.file_id))
 
 
 def _make(unit: list[tuple[int, Step]], log: Log) -> None:
@@ -1530,6 +1589,9 @@ def plan_back(conn, project: str, oid: str) -> Plan:
             if not root_of(os.path.dirname(there), rs):
                 why = "the folder it came from isn't in the library any more"
                 break
+            if s.kind == "folder" and (given := _given_away(conn, here) or _given_away(conn, there)):
+                why = given
+                break
             b = Step(src=here, dst=there, kind=s.kind, unit=u, shot_id=s.shot_id, file_id=s.file_id, size=st.st_size,
                      mtime_ns=st.st_mtime_ns, copied_size=s.copied_size, copied_mtime_ns=s.copied_mtime_ns, tree=s.tree)
             if s.result == "copied" and s.trashed_to and os.path.lexists(s.trashed_to):
@@ -1554,13 +1616,15 @@ def plan_back(conn, project: str, oid: str) -> Plan:
 
 # ---------------------------------------------------------------- after a crash
 
-def recover(conn, project: str) -> list[dict]:
+def recover(conn, project: str, stuck: list | None = None) -> list[dict]:
     """Bring every operation that stopped half way to a consistent end, from its log and what's on
     disk now; each move, and each update of the library, calls this first. A file that reached its
     new place stays there and the catalog follows it; one that didn't stays where it was. A copy to
     another drive that was put in place is checked again and finished (its original goes to the
     Trash); one cut short is removed (JoeyLab's own unfinished copy: its original was never
-    touched). Returns what was done, per operation."""
+    touched). Returns what was done, per operation. One that can't be finished now (a drive gone,
+    say) is left open, said in the service's log and added to `stuck` ({id, label, error}): it never
+    stops the others, or the update or move that asked."""
     d = log_dir()
     if not d.is_dir():
         return []
@@ -1570,7 +1634,15 @@ def recover(conn, project: str) -> list[dict]:
             log = Log.read(path)
         except (OSError, ValueError, TypeError, KeyError):
             continue
-        out.append(_recover(conn, log))
+        try:
+            out.append(_recover(conn, log))
+        except Exception as e:
+            conn.rollback()                   # the units finished before it are saved; this one stays open
+            why = (e.strerror or str(e)) if isinstance(e, OSError) else (str(e) or type(e).__name__)
+            if stuck is not None:
+                stuck.append({"id": log.id, "label": log.header.get("label"), "error": why})
+            print(f"[joeylab] A move in {project!r} that stopped half way couldn't be finished from its log "
+                  f"{path.name}: {why}", file=sys.stderr, flush=True)
     if out:
         _after(conn)
     return out
@@ -1616,6 +1688,7 @@ def _recover(conn, log: Log) -> dict:
     together: in their new place if any of them got there, or else where they were."""
     finished = removed = 0
     for unit in _units(log.steps):
+        conn.commit()                             # each unit's catalog changes are kept with its notes in the log
         for i, s in unit:                         # copies left unfinished under their hidden names
             partial = log.partial(i)
             if partial and os.path.lexists(partial):

@@ -77,9 +77,12 @@ def apply(conn, sid: int, capture_str: str | None) -> None:
 def set_dates(conn, shot_ids: list[int], text: str | None, source: str = "web", viewer: str | None = None) -> dict:
     """Date undated photos (or change or clear a date given by hand), as one undoable step. Photos
     whose files carry a capture date are left as they are. Returns {batch, changed, kept}."""
+    from . import db
+
     when = parse(text) if text else None
-    ensure(conn)
     ids = list(dict.fromkeys(int(i) for i in shot_ids))
+    db.write_lock(conn)                   # each photo's date read, changed and logged as one
+    ensure(conn)
     src: dict[int, str | None] = {}
     for k in range(0, len(ids), 500):
         chunk = ids[k : k + 500]
@@ -141,11 +144,14 @@ def shift_times(conn, shot_ids: list[int], seconds: float, source: str = "web", 
     capture date of its own gets a clock shift (kept by every update, added to its camera's
     correction); one dated by hand has that date moved; one with no date at all is left alone.
     Returns {batch, changed, undated}."""
+    from . import db
+
     seconds = float(seconds)
     if not seconds or abs(seconds) > 2 * 365 * 86400:
         raise ValueError("Shift by up to two years, earlier or later.")
-    ensure(conn)
     ids = list(dict.fromkeys(int(i) for i in shot_ids))
+    db.write_lock(conn)                   # each photo's shift read, changed and logged as one
+    ensure(conn)
     src: dict[int, str | None] = {}
     for k in range(0, len(ids), 500):
         chunk = ids[k : k + 500]

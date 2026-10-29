@@ -24,6 +24,11 @@ from . import config, db, library
 from .export import check_dest
 
 FORMAT = "joeylab-decisions/1"
+# Settings about the catalog itself rather than your work, never carried to another: what it gave away
+# by moves, how far face finding and grouping got and with which model, when trips were last found, and
+# anything kept by its own photo, event or drive ids (another catalog numbers them differently).
+INTERNAL_SETTINGS = {"moved_out", "hwm_clusters", "faces_seen_upto", "faces_full_at", "faces_model", "trip_rule",
+                     "shotlist_tags", "event_joins", "root_drives", "explore_content", "explore_content:landmarks"}
 
 
 # ---------------------------------------------------------------- portable decisions
@@ -58,8 +63,7 @@ def export_decisions(conn, project: str) -> dict:
         some = [files.get(r[0], [])[:1] for r in conn.execute(
             "SELECT id FROM shots WHERE event_id = ? ORDER BY eff_ts LIMIT 20", (e["id"],))]
         events.append({"name": e["name"], "files": [i[0] for i in some if i]})
-    # (Not the frames tagged for the shot list: they're this catalog's photo ids.)
-    settings = {r[0]: json.loads(r[1]) for r in conn.execute("SELECT key, value FROM settings WHERE key != 'shotlist_tags'")}
+    settings = {r[0]: json.loads(r[1]) for r in conn.execute("SELECT key, value FROM settings") if r[0] not in INTERNAL_SETTINGS}
     favs = [{"viewer": r[0], "files": files.get(r[1], [])[:1]} for r in conn.execute(
         "SELECT viewer, shot_id FROM viewer_decisions WHERE fav = 1")]
     comments = [{"viewer": r[0], "text": r[1], "ts": r[2], "files": files.get(r[3], [])[:1]} for r in conn.execute(
@@ -168,6 +172,8 @@ def import_decisions(conn, data: dict, overwrite: bool = False, viewer: str | No
             conn.execute("INSERT OR IGNORE INTO viewer_decisions(viewer, shot_id, fav, updated) VALUES (?,?,1,?)",
                          (f["viewer"], sid, time.time()))
     for k, v in (data.get("settings") or {}).items():
+        if k in INTERNAL_SETTINGS:
+            continue                                    # (from an export made before they were left out)
         if not conn.execute("SELECT 1 FROM settings WHERE key=?", (k,)).fetchone():
             conn.execute("INSERT INTO settings(key, value) VALUES (?,?)", (k, json.dumps(v)))
     conn.commit()

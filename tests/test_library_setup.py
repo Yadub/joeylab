@@ -282,6 +282,35 @@ def test_rename_and_remove_from_the_app(env):
     assert guest.post("/api/projects/t/remove", json={"confirm": "t"}, headers=hdrs).status_code in (401, 403)
 
 
+def test_an_update_that_changes_nothing_says_nothing_and_a_removed_library_stays_removed(env):
+    from joeylab import config
+
+    _, lib = env
+    _shoot(lib)
+    add_root(lib)
+    run_all()
+    c, jobs = _client()
+    c.post("/api/p/t/jobs", json={})                                    # Update now, with nothing new
+    j = _wait(c, "t")
+    assert j["job"]["state"] == "done" and j["job"]["files"] == {"added": 0, "changed": 0, "gone": 0}
+    assert not j["job"]["changed"] and j["version"] == 0                 # open pages aren't told of it
+    jpeg_at(lib / "Shoot" / "IMG_0004.JPG", 9, "2024:05:01 13:00:00")
+    os.remove(lib / "Backup" / "IMG_0003.JPG")
+    c.post("/api/p/t/jobs", json={})
+    first = j["job"]["id"]
+    j = _wait(c, "t", until=lambda j: j["state"] != "running" and j["id"] > first)
+    assert j["job"]["files"] == {"added": 1, "changed": 0, "gone": 1} and j["version"] >= 1
+    # A library removed after its update was asked for (the folder watcher, say) isn't made again.
+    assert c.post("/api/projects/t/remove", json={"confirm": "t"}).status_code == 200
+    job = jobs.start("t", kind="watch", only_if_changed=True)
+    for _ in range(200):
+        if "t" not in jobs.running:
+            break
+        time.sleep(0.02)
+    assert job.stage == "Library removed" and "t" not in jobs.last and "t" not in jobs.versions
+    assert not (config.HOME / "projects" / "t").exists()
+
+
 def test_cli_library_commands(env):
     from typer.testing import CliRunner
 

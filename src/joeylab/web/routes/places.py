@@ -197,6 +197,27 @@ def api_event_merge(p: str, eid: int, request: Request, body: dict = Body(defaul
         raise HTTPException(400, str(e))
 
 
+@router.post("/api/p/{p}/events/unmerge")
+def api_event_unmerge(p: str, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
+    """Undo a merge, from what the merge returned ({undo}): the events come back apart, with their
+    names, and events and trips are found again in the background."""
+    require_writer(request)
+    from ... import locks
+
+    undo = body.get("undo")
+    if not isinstance(undo, dict):
+        raise HTTPException(400, "Say which merge to undo.")
+    try:
+        with locks.project_lock(p, wait=120):
+            r = events_mod.unmerge(conn, undo)
+    except locks.Busy:
+        raise HTTPException(409, "The library is updating. Undo the merge once it has finished.")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    request.app.state.bg.retrip(p)
+    return {**r, "busy": True}
+
+
 @router.post("/api/p/{p}/events/{eid}/place")
 def api_event_place(p: str, eid: int, request: Request, body: dict = Body(default_factory=dict), conn=Depends(conn_dep)):
     """Your place for an event or a trip: {place_id} (a town), or null to take yours away. Set on its
